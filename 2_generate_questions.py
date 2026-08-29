@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-Genera domande atomiche verificabili + risposte ipotizzate per ogni claim
-di un file JSONL, usando un modello LLM locale servito da Ollama.
+Genera domande atomiche verificabili + risposte (derivate solo dal claim) per
+ogni claim di un file JSONL, e per ciascuna coppia domanda/risposta genera anche
+una query di ricerca ottimizzata (Variante B: query derivate dalle risposte),
+usando un modello LLM locale servito da Ollama.
 
 Prerequisiti:
     1) Ollama installato e in esecuzione (https://ollama.com)
@@ -21,7 +23,8 @@ Formato output (per ogni riga):
           "question": "What nationality is the actor who plays Henry Spencer?",
           "answer": "Greek",
           "centrality": 5,
-          "provenance": "claim_text"
+          "provenance": "claim_text",
+          "query": "Henry Spencer actor nationality Greek"
         },
         ...
       ]
@@ -102,7 +105,56 @@ Output: {"questions": [
 USER_PROMPT_TEMPLATE = "Claim: {claim}"
 
 
-def call_ollama(claim: str, model: str, max_retries: int = 3, timeout: int = 120) -> list:
+SYSTEM_PROMPT_QUERY = """You are formulating search-engine queries to help verify a
+claim, given a list of question-answer pairs already derived from that claim.
+
+For each question-answer pair, produce ONE optimized search-engine query string
+that could be typed into Google/Bing to find independent sources confirming or
+contradicting that specific piece of information.
+
+Rules:
+- The query must be KEYWORD-BASED (like something typed into a search engine),
+  NOT a full grammatical question. E.g. prefer "Henry Spencer actor nationality"
+  over "What nationality is the actor who plays Henry Spencer?".
+- Always include the necessary named entities from the claim (proper names,
+  titles, works) so each query is unambiguous even taken in isolation — do not
+  rely on context from other queries.
+- Include the salient keyword(s) from the answer itself (the fact being checked).
+- For questions about exclusivity/superlatives (only, first, most...), formulate
+  a query aimed at finding OTHER instances that could contradict the exclusivity
+  (e.g. for "is X the only drama-mystery series of 2012", produce a query like
+  "drama-mystery television series 2012 list", not just "X drama-mystery 2012").
+- Keep each query concise, typically under 12 words.
+- Use quotation marks only around an exact multi-word proper name/title you want
+  matched exactly (e.g. "13 Reasons Why").
+- Preserve the exact order of the input list: output exactly one query per input
+  pair, in the same order, no more, no fewer.
+
+Respond with ONLY a valid JSON object, no markdown, no commentary, in exactly this
+schema:
+
+{
+  "queries": ["...", "...", ...]
+}
+
+Example:
+Claim: "13 Reasons Why is the only television series of 2012 in the drama-mystery genre."
+Questions: [
+  {"question": "Is 13 Reasons Why the only drama-mystery television series released in 2012, or are there others?", "answer": "It is claimed to be the only one"},
+  {"question": "What genre is the television series 13 Reasons Why associated with in this claim?", "answer": "Drama-mystery"},
+  {"question": "In what year was 13 Reasons Why released, according to this claim?", "answer": "2012"}
+]
+Output: {"queries": [
+  "drama-mystery television series 2012 list",
+  "\\"13 Reasons Why\\" genre drama mystery",
+  "\\"13 Reasons Why\\" release year 2012"
+]}
+"""
+
+USER_PROMPT_QUERY_TEMPLATE = "Claim: {claim}\nQuestions: {questions_json}"
+
+
+def call_ollama_questions(claim: str, model: str, max_retries: int = 3, timeout: int = 120) -> list:
     """Chiama il server Ollama locale e restituisce la lista di domande/risposte."""
     payload = {
         "model": model,
@@ -157,6 +209,65 @@ def call_ollama(claim: str, model: str, max_retries: int = 3, timeout: int = 120
     return []
 
 
+def call_ollama_queries(claim: str, questions: list, model: str, max_retries: int = 3, timeout: int = 120) -> list:
+    """Genera una query di ricerca per ciascuna coppia domanda/risposta (Variante B).
+
+    Restituisce una lista di stringhe della stessa lunghezza di `questions`, nello
+    stesso ordine. In caso di fallimento dopo i retry, ritorna una lista di fallback
+    costruita concatenando naively domanda+risposta, così il pipeline non si blocca.
+    """
+    if not questions:
+        return []
+
+    # passiamo al modello solo question+answer, non centrality/provenance, per non
+    # sprecare token e non confonderlo con campi irrilevanti al task di query gen.
+    qa_payload = [{"question": q["question"], "answer": q["answer"]} for q in questions]
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT_QUERY},
+            {"role": "user", "content": USER_PROMPT_QUERY_TEMPLATE.format(
+                claim=claim,
+                questions_json=json.dumps(qa_payload, ensure_ascii=False),
+            )},
+        ],
+        "format": "json",
+        "stream": False,
+        "options": {"temperature": 0.2},
+    }
+
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.post(OLLAMA_URL, json=payload, timeout=timeout)
+            resp.raise_for_status()
+            content = resp.json()["message"]["content"]
+            parsed = json.loads(content)
+            queries = parsed.get("queries", [])
+
+            if isinstance(queries, list) and len(queries) == len(questions):
+                cleaned = [str(q).strip() for q in queries]
+                if all(cleaned):
+                    return cleaned
+                last_err = "one or more empty queries returned"
+            else:
+                last_err = f"expected {len(questions)} queries, got {len(queries) if isinstance(queries, list) else type(queries)}"
+        except (requests.RequestException, json.JSONDecodeError, KeyError) as e:
+            last_err = str(e)
+
+        print(f"  [retry {attempt}/{max_retries}] query generation failed: {last_err}", file=sys.stderr)
+        time.sleep(2 * attempt)
+
+    print(f"  [WARN] falling back to naive queries after {max_retries} attempts: {last_err}", file=sys.stderr)
+    # fallback naive: concatena domanda-chiave (senza punteggiatura) + risposta
+    fallback = []
+    for q in questions:
+        naive = re.sub(r"[?]", "", q["question"]).strip()
+        fallback.append(f"{naive} {q['answer']}".strip())
+    return fallback
+
+
 def process_file(input_path: str, output_path: str, model: str, limit: int = None):
     with open(input_path, "r", encoding="utf-8") as fin, \
          open(output_path, "w", encoding="utf-8") as fout:
@@ -173,7 +284,12 @@ def process_file(input_path: str, output_path: str, model: str, limit: int = Non
             claim = record.get("claim", "")
 
             print(f"[{i}] id={claim_id} -> {claim}")
-            questions = call_ollama(claim, model=model)
+            questions = call_ollama_questions(claim, model=model)
+
+            if questions:
+                queries = call_ollama_queries(claim, questions, model=model)
+                for q, query in zip(questions, queries):
+                    q["query"] = query
 
             # ricostruisco l'oggetto per inserire "questions" subito dopo "claim"
             new_record = {}
