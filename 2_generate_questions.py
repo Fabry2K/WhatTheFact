@@ -1,9 +1,21 @@
 #!/usr/bin/env python3
 """
-Genera domande atomiche verificabili + risposte (derivate solo dal claim) per
-ogni claim di un file JSONL, e per ciascuna coppia domanda/risposta genera anche
-una query di ricerca ottimizzata (Variante B: query derivate dalle risposte),
-usando un modello LLM locale servito da Ollama.
+Fase 2: genera domande atomiche verificabili + risposte (derivate SOLO dal testo
+sorgente, mai da conoscenza esterna del modello) e, per ciascuna coppia
+domanda/risposta, una query di ricerca ottimizzata (Variante B: query derivate
+dalle risposte). Usa un modello LLM locale servito da Ollama.
+
+Supporta due modalità:
+
+  --mode claim (default se l'input NON è .csv)
+      Input: JSONL con una riga per claim breve, es. {"id": 89296, "claim": "..."}
+      Genera 1-5 domande per claim (un claim breve fa poche asserzioni).
+
+  --mode document (default se l'input è .csv)
+      Input: CSV con colonne (id opzionale);title;text;label(opzionale), es. un
+      dataset di articoli di news. Genera 5-15 domande per documento (un articolo
+      intero contiene molte più asserzioni di un claim breve), con chunking
+      automatico per i testi troppo lunghi per il context window del modello.
 
 Prerequisiti:
     1) Ollama installato e in esecuzione (https://ollama.com)
@@ -12,9 +24,13 @@ Prerequisiti:
     3) pip install requests
 
 Uso:
+    # modalità claim (JSONL di claim brevi)
     python generate_questions.py --input claims.jsonl --output claims_with_questions.jsonl
 
-Formato output (per ogni riga):
+    # modalità document (CSV di articoli interi)
+    python generate_questions.py --input evaluation.csv --output evaluation_with_questions.jsonl --mode document
+
+Formato output — modalità claim (per ogni riga):
     {
       "id": 89296,
       "claim": "Henry Spencer is played by a Greek actor.",
@@ -25,6 +41,23 @@ Formato output (per ogni riga):
           "centrality": 5,
           "provenance": "claim_text",
           "query": "Henry Spencer actor nationality Greek"
+        },
+        ...
+      ]
+    }
+
+Formato output — modalità document (per ogni riga):
+    {
+      "id": 0,
+      "title": "Sanders back in U.S. Senate, blasts 'colonialism' in Puerto Rico",
+      "label": "1",
+      "questions": [
+        {
+          "question": "Who condemned the Puerto Rico bill as 'colonialism at its worst'?",
+          "answer": "Bernie Sanders",
+          "centrality": 5,
+          "provenance": "document_text",
+          "query": "Bernie Sanders Puerto Rico bill colonialism"
         },
         ...
       ]
@@ -105,6 +138,67 @@ Output: {"questions": [
 USER_PROMPT_TEMPLATE = "Claim: {claim}"
 
 
+SYSTEM_PROMPT_DOCUMENT = """You are decomposing a DOCUMENT (a full article, not a
+short claim) into atomic question-answer pairs.
+
+CRITICAL RULE: both the questions and the answers must be based STRICTLY AND ONLY
+on the information explicitly stated in the document text itself.
+- Do NOT use any outside/world knowledge.
+- Do NOT verify, fact-check, correct, or add information beyond the document.
+- Do NOT invent names, dates, locations, numbers, or any detail that is not
+  explicitly written in the document.
+- If the document does not mention something, do NOT ask about it.
+
+Steps:
+1. Identify the distinct atomic ASSERTIONS/FACTS stated in the document (who did
+   what, when, where, how much, quotes attributed to someone, outcomes, etc.).
+   A full document usually contains many more assertions than a short claim —
+   extract as many as are genuinely present and verifiable, typically between
+   5 and 15 depending on the length and density of the document. Do not pad
+   with trivial/redundant questions just to reach a number, and do not omit
+   real facts to keep the list short.
+   - Pay special attention to quantifiers, exclusivity, and superlative words
+     (e.g. "only", "first", "most", "never", "always", "record"). These usually
+     carry a central assertion and must get their own dedicated question with
+     centrality 5.
+   - Cover the most newsworthy/central facts first (who/what/when/where of the
+     main event), then supporting details (quotes, numbers, context).
+2. For each assertion, write a QUESTION that asks specifically about that piece
+   of information, phrased so it could later be asked about a different,
+   independent source (keyword/fact-oriented, not a yes/no question about the
+   document itself).
+3. Write the ANSWER using ONLY the wording/information already present in the
+   document (verbatim or minimally rephrased). Never add facts not in the text.
+4. Assign a CENTRALITY score from 1 to 5:
+   - 5 = core fact of the document (the main event/claim it is reporting)
+   - 1 = a marginal/peripheral detail
+
+Respond with ONLY a valid JSON object, no markdown, no commentary, in exactly this
+schema:
+
+{
+  "questions": [
+    {"question": "...", "answer": "...", "centrality": 1-5}
+  ]
+}
+
+Example:
+Document title: "Sanders back in U.S. Senate, blasts 'colonialism' in Puerto Rico"
+Document text: "WASHINGTON (Reuters) - Democratic U.S. presidential hopeful Bernie
+Sanders brought his firebrand rhetoric back to the floor of the Senate on Tuesday
+to condemn a White House-backed bill on Puerto Rico's financial crisis as
+'colonialism at its worst.' [...] the island to pay $370 million over five years
+for the board's administration costs [...]"
+Output: {"questions": [
+  {"question": "Who condemned the Puerto Rico bill as 'colonialism at its worst'?", "answer": "Bernie Sanders", "centrality": 5},
+  {"question": "On what day did Sanders speak on the Senate floor about the Puerto Rico bill?", "answer": "Tuesday", "centrality": 4},
+  {"question": "How much would Puerto Rico have to pay over five years for the oversight board's administration costs, according to the document?", "answer": "$370 million", "centrality": 3}
+]}
+"""
+
+USER_PROMPT_DOCUMENT_TEMPLATE = "Document title: {title}\nDocument text: {text}"
+
+
 SYSTEM_PROMPT_QUERY = """You are formulating search-engine queries to help verify a
 claim, given a list of question-answer pairs already derived from that claim.
 
@@ -152,6 +246,25 @@ Output: {"queries": [
 """
 
 USER_PROMPT_QUERY_TEMPLATE = "Claim: {claim}\nQuestions: {questions_json}"
+
+
+def split_into_chunks(text: str, max_words: int = 1800, overlap_words: int = 150) -> list:
+    """Divide un testo lungo in chunk di circa `max_words` parole, con overlap,
+    per stare dentro al context window del modello. Se il testo è già corto,
+    restituisce una lista con un solo elemento (il testo intero)."""
+    words = text.split()
+    if len(words) <= max_words:
+        return [text]
+
+    chunks = []
+    start = 0
+    while start < len(words):
+        end = min(start + max_words, len(words))
+        chunks.append(" ".join(words[start:end]))
+        if end == len(words):
+            break
+        start = end - overlap_words
+    return chunks
 
 
 def call_ollama_questions(claim: str, model: str, max_retries: int = 3, timeout: int = 120) -> list:
@@ -207,6 +320,81 @@ def call_ollama_questions(claim: str, model: str, max_retries: int = 3, timeout:
 
     print(f"  [WARN] giving up on claim after {max_retries} attempts: {last_err}", file=sys.stderr)
     return []
+
+
+def call_ollama_questions_document_chunk(title: str, text_chunk: str, model: str,
+                                          max_retries: int = 3, timeout: int = 180) -> list:
+    """Come call_ollama_questions, ma per un chunk di documento (prompt e schema
+    dedicati, pensati per estrarre più assertion di quante ne abbia un claim breve)."""
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT_DOCUMENT},
+            {"role": "user", "content": USER_PROMPT_DOCUMENT_TEMPLATE.format(title=title, text=text_chunk)},
+        ],
+        "format": "json",
+        "stream": False,
+        "options": {"temperature": 0.2, "num_predict": 2048},
+    }
+
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.post(OLLAMA_URL, json=payload, timeout=timeout)
+            resp.raise_for_status()
+            content = resp.json()["message"]["content"]
+            parsed = json.loads(content)
+            questions = parsed.get("questions", [])
+
+            cleaned = []
+            for q in questions:
+                if not isinstance(q, dict):
+                    continue
+                question = str(q.get("question", "")).strip()
+                answer = str(q.get("answer", "")).strip()
+                centrality = q.get("centrality", 3)
+                try:
+                    centrality = int(centrality)
+                except (TypeError, ValueError):
+                    centrality = 3
+                centrality = max(1, min(5, centrality))
+                if question and answer:
+                    cleaned.append({
+                        "question": question,
+                        "answer": answer,
+                        "centrality": centrality,
+                        "provenance": "document_text",
+                    })
+            if cleaned:
+                return cleaned
+            last_err = "empty/invalid questions list"
+        except (requests.RequestException, json.JSONDecodeError, KeyError) as e:
+            last_err = str(e)
+
+        print(f"    [retry {attempt}/{max_retries}] failed: {last_err}", file=sys.stderr)
+        time.sleep(2 * attempt)
+
+    print(f"    [WARN] giving up on chunk after {max_retries} attempts: {last_err}", file=sys.stderr)
+    return []
+
+
+def call_ollama_questions_document(title: str, text: str, model: str,
+                                    max_words: int = 1800, overlap_words: int = 150) -> list:
+    """Genera domande/risposte per un documento intero, spezzandolo in chunk se
+    troppo lungo per il context window, e unendo i risultati di tutti i chunk."""
+    chunks = split_into_chunks(text, max_words=max_words, overlap_words=overlap_words)
+
+    all_questions = []
+    for ci, chunk in enumerate(chunks, start=1):
+        if len(chunks) > 1:
+            print(f"  chunk {ci}/{len(chunks)} ({len(chunk.split())} parole)")
+        chunk_questions = call_ollama_questions_document_chunk(title, chunk, model=model)
+        for q in chunk_questions:
+            if len(chunks) > 1:
+                q["chunk_index"] = ci
+        all_questions.extend(chunk_questions)
+
+    return all_questions
 
 
 def call_ollama_queries(claim: str, questions: list, model: str, max_retries: int = 3, timeout: int = 120) -> list:
@@ -268,7 +456,8 @@ def call_ollama_queries(claim: str, questions: list, model: str, max_retries: in
     return fallback
 
 
-def process_file(input_path: str, output_path: str, model: str, limit: int = None):
+def process_file_claims(input_path: str, output_path: str, model: str, limit: int = None):
+    """Modalità 'claim': legge un JSONL con {"id", "claim"} per riga (comportamento originale)."""
     with open(input_path, "r", encoding="utf-8") as fin, \
          open(output_path, "w", encoding="utf-8") as fout:
 
@@ -302,15 +491,94 @@ def process_file(input_path: str, output_path: str, model: str, limit: int = Non
             fout.flush()
 
 
+def process_file_documents(input_path: str, output_path: str, model: str, limit: int = None,
+                            max_words: int = 1800, overlap_words: int = 150,
+                            include_text: bool = False, csv_delimiter: str = ";"):
+    """Modalità 'document': legge un CSV con colonne (id opzionale);title;text;label
+    (label opzionale) e genera domande/risposte sull'intero documento, con
+    chunking automatico per i testi troppo lunghi."""
+    import csv
+
+    with open(input_path, "r", encoding="utf-8", newline="") as fin, \
+         open(output_path, "w", encoding="utf-8") as fout:
+
+        reader = csv.DictReader(fin, delimiter=csv_delimiter)
+        # normalizza l'header: la prima colonna spesso non ha nome (indice riga)
+        fieldnames = reader.fieldnames or []
+        id_field = fieldnames[0] if fieldnames and fieldnames[0].strip() == "" else None
+
+        for i, row in enumerate(reader):
+            if limit is not None and i >= limit:
+                break
+
+            doc_id = row.get(id_field) if id_field else row.get("id", i)
+            if doc_id is None or doc_id == "":
+                doc_id = i
+            title = (row.get("title") or "").strip()
+            text = (row.get("text") or "").strip()
+            label = row.get("label")
+
+            if not text:
+                print(f"[{i}] id={doc_id} -> [WARN] testo vuoto, salto")
+                continue
+
+            print(f"[{i}] id={doc_id} -> {title[:80]}")
+            questions = call_ollama_questions_document(
+                title, text, model=model, max_words=max_words, overlap_words=overlap_words,
+            )
+
+            if questions:
+                # per la query generation usiamo titolo+inizio testo come contesto,
+                # non l'intero documento: basta per disambiguare le entità
+                context_text = title if title else " ".join(text.split()[:100])
+                queries = call_ollama_queries(context_text, questions, model=model)
+                for q, query in zip(questions, queries):
+                    q["query"] = query
+
+            new_record = {
+                "id": doc_id,
+                "title": title,
+            }
+            if label is not None and label != "":
+                new_record["label"] = label
+            if include_text:
+                new_record["text"] = text
+            new_record["questions"] = questions
+
+            fout.write(json.dumps(new_record, ensure_ascii=False) + "\n")
+            fout.flush()
+            print(f"  -> {len(questions)} domande generate")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--input", required=True, help="Path al file JSONL di input")
+    parser.add_argument("--input", required=True, help="Path al file di input (JSONL per --mode claim, CSV per --mode document)")
     parser.add_argument("--output", required=True, help="Path al file JSONL di output")
+    parser.add_argument("--mode", choices=["claim", "document"], default=None,
+                         help="'claim' per JSONL di claim brevi, 'document' per CSV di documenti interi. "
+                              "Se omesso, viene dedotto dall'estensione del file di input (.csv -> document, altrimenti claim).")
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Nome modello Ollama (default: {DEFAULT_MODEL})")
     parser.add_argument("--limit", type=int, default=None, help="Processa solo le prime N righe (utile per test)")
+    parser.add_argument("--max-words", type=int, default=1800, help="[solo --mode document] dimensione massima (in parole) di un chunk di documento (default: 1800)")
+    parser.add_argument("--overlap-words", type=int, default=150, help="[solo --mode document] overlap in parole tra chunk consecutivi (default: 150)")
+    parser.add_argument("--include-text", action="store_true", help="[solo --mode document] include il testo completo del documento nell'output (di default omesso per tenere il file leggero)")
+    parser.add_argument("--csv-delimiter", default=";", help="[solo --mode document] delimitatore del CSV (default: ';')")
     args = parser.parse_args()
 
-    process_file(args.input, args.output, model=args.model, limit=args.limit)
+    mode = args.mode
+    if mode is None:
+        mode = "document" if args.input.lower().endswith(".csv") else "claim"
+        print(f"[INFO] --mode non specificato, dedotto '{mode}' dall'estensione del file di input")
+
+    if mode == "claim":
+        process_file_claims(args.input, args.output, model=args.model, limit=args.limit)
+    else:
+        process_file_documents(
+            args.input, args.output, model=args.model, limit=args.limit,
+            max_words=args.max_words, overlap_words=args.overlap_words,
+            include_text=args.include_text, csv_delimiter=args.csv_delimiter,
+        )
+
     print(f"\nFatto. Output scritto in: {args.output}")
 
 

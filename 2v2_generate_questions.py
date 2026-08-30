@@ -53,11 +53,10 @@ Formato output — modalità document (per ogni riga):
       "label": "1",
       "questions": [
         {
-          "question": "Who condemned the Puerto Rico bill as 'colonialism at its worst'?",
-          "answer": "Bernie Sanders",
+          "assertion": "Bernie Sanders condemned the Puerto Rico bill as 'colonialism at its worst'",
           "centrality": 5,
-          "provenance": "document_text",
-          "query": "Bernie Sanders Puerto Rico bill colonialism"
+          "query": "Bernie Sanders Puerto Rico bill colonialism",
+          "provenance": "document_text"
         },
         ...
       ]
@@ -138,62 +137,50 @@ Output: {"questions": [
 USER_PROMPT_TEMPLATE = "Claim: {claim}"
 
 
-SYSTEM_PROMPT_DOCUMENT = """You are decomposing a DOCUMENT (a full article, not a
-short claim) into atomic question-answer pairs.
+SYSTEM_PROMPT_DOCUMENT = """You are given the title and text of a news article.
 
-CRITICAL RULE: both the questions and the answers must be based STRICTLY AND ONLY
-on the information explicitly stated in the document text itself.
-- Do NOT use any outside/world knowledge.
-- Do NOT verify, fact-check, correct, or add information beyond the document.
-- Do NOT invent names, dates, locations, numbers, or any detail that is not
-  explicitly written in the document.
-- If the document does not mention something, do NOT ask about it.
+            Decompose the article into its key factual assertions. For each one, produce
+            a short, atomic, independently verifiable search query to find sources that
+            confirm or contradict it.
 
-Steps:
-1. Identify the distinct atomic ASSERTIONS/FACTS stated in the document (who did
-   what, when, where, how much, quotes attributed to someone, outcomes, etc.).
-   A full document usually contains many more assertions than a short claim —
-   extract as many as are genuinely present and verifiable, typically between
-   5 and 15 depending on the length and density of the document. Do not pad
-   with trivial/redundant questions just to reach a number, and do not omit
-   real facts to keep the list short.
-   - Pay special attention to quantifiers, exclusivity, and superlative words
-     (e.g. "only", "first", "most", "never", "always", "record"). These usually
-     carry a central assertion and must get their own dedicated question with
-     centrality 5.
-   - Cover the most newsworthy/central facts first (who/what/when/where of the
-     main event), then supporting details (quotes, numbers, context).
-2. For each assertion, write a QUESTION that asks specifically about that piece
-   of information, phrased so it could later be asked about a different,
-   independent source (keyword/fact-oriented, not a yes/no question about the
-   document itself).
-3. Write the ANSWER using ONLY the wording/information already present in the
-   document (verbatim or minimally rephrased). Never add facts not in the text.
-4. Assign a CENTRALITY score from 1 to 5:
-   - 5 = core fact of the document (the main event/claim it is reporting)
-   - 1 = a marginal/peripheral detail
+            Respond with ONLY a valid JSON object, no markdown, no commentary, in
+            exactly this schema:
 
-Respond with ONLY a valid JSON object, no markdown, no commentary, in exactly this
-schema:
+            {
+              "assertions": [
+                {"id": 1, "assertion": "short paraphrase of the fact", "centrality": 1-5, "query": "search-engine-style query"}
+              ]
+            }
 
-{
-  "questions": [
-    {"question": "...", "answer": "...", "centrality": 1-5}
-  ]
-}
+            - "centrality" (1-5): 5 = the article's main claim/event, 3-4 = supporting
+            facts, 1-2 = minor/background details.
+            - "query": short and natural, not a full sentence or question.
 
-Example:
-Document title: "Sanders back in U.S. Senate, blasts 'colonialism' in Puerto Rico"
-Document text: "WASHINGTON (Reuters) - Democratic U.S. presidential hopeful Bernie
-Sanders brought his firebrand rhetoric back to the floor of the Senate on Tuesday
-to condemn a White House-backed bill on Puerto Rico's financial crisis as
-'colonialism at its worst.' [...] the island to pay $370 million over five years
-for the board's administration costs [...]"
-Output: {"questions": [
-  {"question": "Who condemned the Puerto Rico bill as 'colonialism at its worst'?", "answer": "Bernie Sanders", "centrality": 5},
-  {"question": "On what day did Sanders speak on the Senate floor about the Puerto Rico bill?", "answer": "Tuesday", "centrality": 4},
-  {"question": "How much would Puerto Rico have to pay over five years for the oversight board's administration costs, according to the document?", "answer": "$370 million", "centrality": 3}
-]}
+            GROUNDING (critical): every entity, date, number, or name in a query must
+            appear explicitly in the article. Never infer, round, or "correct" a date
+            or number that seems plausible — if it's not stated in the text, leave it
+            out. Before finalizing a query, check you could point to the exact sentence
+            supporting each fact in it.
+
+            ENTITIES: resolve nicknames, pejorative epithets, or informal monikers to
+            the real name of the person/entity they refer to (e.g. "Mr. Teleprompter"
+            → "Obama"). The query must use the real, searchable name — a query built
+            around a nickname will not find real sources. The informal wording can stay
+            in "assertion" for context, but never in "query".
+
+            SCOPE: only extract assertions about the event/story being reported. Ignore
+            metadata about the article itself (image credits, author bio, embedded
+            media captions, formatting).
+
+            ATOMICITY: one query = one verifiable fact. Don't combine unrelated facts
+            into one query, and don't generate multiple queries for the same fact from
+            different angles (pick the most specific one).
+
+            Skip generic, trivial, or purely rhetorical details. Opinions/interpretations
+            are fine to include if there's a verifiable fact underneath them (e.g. "X
+            said Y"), even if the wording itself is rhetorical.
+
+            Aim for ~4-8 queries depending on the article's density of distinct facts.
 """
 
 USER_PROMPT_DOCUMENT_TEMPLATE = "Document title: {title}\nDocument text: {text}"
@@ -324,8 +311,11 @@ def call_ollama_questions(claim: str, model: str, max_retries: int = 3, timeout:
 
 def call_ollama_questions_document_chunk(title: str, text_chunk: str, model: str,
                                           max_retries: int = 3, timeout: int = 180) -> list:
-    """Come call_ollama_questions, ma per un chunk di documento (prompt e schema
-    dedicati, pensati per estrarre più assertion di quante ne abbia un claim breve)."""
+    """Come call_ollama_questions, ma per un chunk di documento. Il prompt per
+    documenti (SYSTEM_PROMPT_DOCUMENT) chiede al modello una LISTA JSON piatta
+    [{"id":..., "assertion":..., "centrality":..., "query":...}], non l'oggetto
+    {"questions": [...]} usato in modalità claim — il parsing qui sotto è
+    specifico per questo schema."""
     payload = {
         "model": model,
         "messages": [
@@ -344,32 +334,48 @@ def call_ollama_questions_document_chunk(title: str, text_chunk: str, model: str
             resp.raise_for_status()
             content = resp.json()["message"]["content"]
             parsed = json.loads(content)
-            questions = parsed.get("questions", [])
+
+            # il modello ora dovrebbe restituire {"assertions": [...]}; teniamo
+            # comunque un fallback robusto nel caso avvolga diversamente o
+            # restituisca una lista nuda
+            if isinstance(parsed, dict) and isinstance(parsed.get("assertions"), list):
+                items = parsed["assertions"]
+            elif isinstance(parsed, list):
+                items = parsed
+            elif isinstance(parsed, dict):
+                items = next((v for v in parsed.values() if isinstance(v, list)), [])
+            else:
+                items = []
 
             cleaned = []
-            for q in questions:
-                if not isinstance(q, dict):
+            for item in items:
+                if not isinstance(item, dict):
                     continue
-                question = str(q.get("question", "")).strip()
-                answer = str(q.get("answer", "")).strip()
-                centrality = q.get("centrality", 3)
+                assertion = str(item.get("assertion", "")).strip()
+                query = str(item.get("query", "")).strip()
+                centrality = item.get("centrality", 3)
                 try:
                     centrality = int(centrality)
                 except (TypeError, ValueError):
                     centrality = 3
                 centrality = max(1, min(5, centrality))
-                if question and answer:
+                if assertion and query:
                     cleaned.append({
-                        "question": question,
-                        "answer": answer,
+                        "assertion": assertion,
                         "centrality": centrality,
+                        "query": query,
                         "provenance": "document_text",
                     })
             if cleaned:
                 return cleaned
-            last_err = "empty/invalid questions list"
+            last_err = "empty/invalid assertions list"
+            print(f"    [DEBUG] raw model content (primi 800 char): {content[:800]!r}", file=sys.stderr)
         except (requests.RequestException, json.JSONDecodeError, KeyError) as e:
             last_err = str(e)
+            try:
+                print(f"    [DEBUG] raw response (primi 800 char): {resp.text[:800]!r}", file=sys.stderr)
+            except Exception:
+                pass
 
         print(f"    [retry {attempt}/{max_retries}] failed: {last_err}", file=sys.stderr)
         time.sleep(2 * attempt)
@@ -526,14 +532,10 @@ def process_file_documents(input_path: str, output_path: str, model: str, limit:
             questions = call_ollama_questions_document(
                 title, text, model=model, max_words=max_words, overlap_words=overlap_words,
             )
-
-            if questions:
-                # per la query generation usiamo titolo+inizio testo come contesto,
-                # non l'intero documento: basta per disambiguare le entità
-                context_text = title if title else " ".join(text.split()[:100])
-                queries = call_ollama_queries(context_text, questions, model=model)
-                for q, query in zip(questions, queries):
-                    q["query"] = query
+            # nota: con SYSTEM_PROMPT_DOCUMENT la query è già generata insieme
+            # all'assertion in un unico step, quindi qui non serve più una
+            # seconda chiamata a call_ollama_queries (a differenza della
+            # modalità 'claim', dove restano due step separati)
 
             new_record = {
                 "id": doc_id,
