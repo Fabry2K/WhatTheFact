@@ -1,0 +1,220 @@
+# Pipeline di Verifica Automatica dei Claim — Guida rapida
+
+Questo README spiega come installare le dipendenze e in che ordine lanciare gli
+script sviluppati finora (Fase 2 e Fase 3 dell'assignment).
+
+## Panoramica della pipeline
+
+```
+Fase 2 — generate_questions.py
+   Input:  claims.jsonl (claim brevi)  OPPURE  evaluation.csv (articoli interi)
+   Output: *_with_questions.jsonl  (claim/documento + domande/assertion + query)
+        │
+        ▼
+Fase 3 — download_sources.py
+   Input:  il file *_with_questions.jsonl prodotto sopra
+   Output: cartella sources/<id>/  con le pagine scaricate per ogni query
+```
+
+Vanno lanciati **in questo ordine**: prima `generate_questions.py`, poi
+`download_sources.py` sul file che il primo ha prodotto.
+
+---
+
+## 1. Prerequisiti
+
+### 1.1 Python
+
+```bash
+python3 --version   # su Windows: py --version
+```
+
+Se non è installato: https://python.org/downloads (su Windows spunta "Add
+Python to PATH" durante l'installazione).
+
+### 1.2 Dipendenze Python
+
+```bash
+pip install requests
+```
+
+### 1.3 Ollama (per la Fase 2 — genera domande/query in locale, gratis)
+
+Installazione:
+
+```bash
+# macOS / Linux
+curl -fsSL https://ollama.com/install.sh | sh
+
+# Windows: scarica l'installer da https://ollama.com/download
+```
+
+Scarica il modello:
+
+```bash
+ollama pull qwen2.5:7b-instruct
+```
+
+Verifica che il server sia attivo (di solito parte da solo dopo l'installazione):
+
+```bash
+curl http://localhost:11434/api/tags
+```
+
+Se risponde con un JSON che elenca `qwen2.5:7b-instruct`, è tutto pronto.
+
+### 1.4 Tavily API key (per la Fase 3 — ricerca + download pagine)
+
+1. Registrati gratis su https://tavily.com (free tier: 1000 crediti/mese, nessuna carta richiesta)
+2. Copia la tua API key (formato `tvly-xxxxx`)
+3. Impostala come variabile d'ambiente **prima** di lanciare `download_sources.py`:
+
+```bash
+# macOS / Linux
+export TAVILY_API_KEY="tvly-xxxxx"
+
+# Windows (PowerShell)
+$env:TAVILY_API_KEY="tvly-xxxxx"
+```
+
+> **Non incollare mai la chiave direttamente nel codice o in chat** — se
+> l'hai già condivisa da qualche parte, rigenerala dalla dashboard Tavily.
+
+---
+
+## 2. Fase 2 — `generate_questions.py`
+
+Genera domande/assertion + query di ricerca a partire dal testo sorgente
+(claim breve o documento intero), usando **solo** informazioni presenti nel
+testo stesso (mai conoscenza esterna del modello).
+
+Supporta due modalità, dedotte automaticamente dall'estensione del file di
+input se non specificate:
+
+| Modalità     | Quando si usa                          | Input atteso                                   |
+|--------------|-----------------------------------------|--------------------------------------------------|
+| `claim`      | Claim brevi (una frase)                 | JSONL con `{"id": ..., "claim": "..."}` per riga |
+| `document`   | Articoli/documenti interi               | CSV con colonne `;title;text;label` (`;` sep.)   |
+
+### Uso
+
+
+- FIRST PROMPT
+```bash
+# Modalità claim
+python3 2_generate_questions.py --input Files/claims.jsonl --output Files/claims_with_questions_first_prompt.jsonl
+
+# Modalità document
+python3 2_generate_questions.py --input Files/evaluation.csv --output Files/evaluation_with_questions_first_prompt.jsonl --mode document
+
+
+- SECOND PROMPT
+```bash
+# Modalità claim
+python3 2v2_generate_questions.py --input Files/claims.jsonl --output Files/claims_with_questions_second_prompt.jsonl
+
+# Modalità document
+python3 2v2_generate_questions.py --input Files/evaluation.csv --output Files/evaluation_with_questions_second_prompt.jsonl --mode document
+
+
+
+**Consiglio**: testa sempre prima su poche righe con `--limit`, prima di
+lanciare la run completa (specialmente in modalità `document`, dove ogni
+articolo può generare più chiamate al modello):
+
+```bash
+python3 generate_questions.py --input evaluation.csv --output test.jsonl --mode document --limit 5
+```
+
+### Argomenti principali
+
+| Argomento | Descrizione | Default |
+|---|---|---|
+| `--input` | File di input (obbligatorio) | — |
+| `--output` | File JSONL di output (obbligatorio) | — |
+| `--mode` | `claim` o `document` | dedotto dall'estensione (`.csv` → `document`) |
+| `--model` | Nome modello Ollama | `qwen2.5:7b-instruct` |
+| `--limit` | Processa solo le prime N righe | tutte |
+| `--max-words` | *(solo document)* dimensione chunk in parole | `1800` |
+| `--overlap-words` | *(solo document)* overlap tra chunk in parole | `150` |
+| `--include-text` | *(solo document)* include il testo integrale nell'output | disattivo |
+| `--csv-delimiter` | *(solo document)* delimitatore del CSV | `;` |
+
+### Output
+
+- **Modalità claim**: per ogni claim, lista `questions` con `question`,
+  `answer`, `centrality`, `provenance`, `query`.
+- **Modalità document**: per ogni documento, lista `questions` con
+  `assertion`, `centrality`, `query`, `provenance` (schema diverso dalla
+  modalità claim: qui query e assertion sono generate in un unico step, senza
+  campo `answer` separato).
+
+---
+
+## 3. Fase 3 — `download_sources.py`
+
+Per ogni query generata in Fase 2, cerca su Tavily e scarica le prime **X**
+pagine di risultato, organizzate in cartelle per id del claim/documento.
+
+### Uso
+
+```bash
+python3 3_download_sources.py --input Files/***phase_2_output_file_name***.jsonl --output-dir Files/sources --num-results 5
+```
+
+
+### Argomenti principali
+
+| Argomento | Descrizione | Default |
+|---|---|---|
+| `--input` | File JSONL prodotto da `generate_questions.py` (obbligatorio) | — |
+| `--output-dir` | Cartella base dove creare le sottocartelle | `sources` |
+| `--num-results` / `-x` | Numero di risultati da scaricare per query (X) | `5` |
+| `--limit` | Processa solo le prime N righe del file di input | tutte |
+| `--api-key` | Tavily API key | legge da env var `TAVILY_API_KEY` |
+| `--search-depth` | `basic` (1 credito/query) o `advanced` (2 crediti/query) | `basic` |
+| `--delay` | Pausa in secondi tra una query e l'altra | `0.5` |
+| `--no-skip-existing` | Riscarica anche i claim già completati | disattivo (skip attivo) |
+
+### Output
+
+```
+sources/
+  <id>/
+    manifest.json         <- indice di tutti i download per questo claim/documento
+    q01_r01.txt            <- risultato 1 della query 1 (URL, titolo, query, contenuto pagina)
+    q01_r02.txt
+    ...
+```
+
+### Note sui crediti Tavily
+
+Ogni chiamata di ricerca costa 1 credito in modalità `basic` (indipendentemente
+da quanti risultati `X` chiedi). Con 1000 crediti/mese gratuiti e ~3-8 query
+per claim/documento, puoi processare all'incirca **125-300 claim/documenti al
+mese** in modalità `basic`. Se devi processare un dataset grande, valuta
+`--limit` per procedere a lotti, o monitora il consumo dalla dashboard Tavily.
+
+---
+
+## 4. Esempio di run end-to-end
+
+```bash
+export TAVILY_API_KEY="tvly-xxxxx"
+
+# Fase 2
+python3 generate_questions.py --input evaluation.csv --output evaluation_with_questions.jsonl --mode document --limit 20
+
+# Fase 3 (usa l'output della Fase 2 come input)
+python3 download_sources.py --input evaluation_with_questions.jsonl --output-dir sources --num-results 5 --limit 20
+```
+
+---
+
+## 5. Problemi comuni
+
+- **`python: command not found`** → usa `python3` (macOS/Linux) o `py` (Windows). Vedi sezione 1.1.
+- **`usage: ... error: the following arguments are required: --output`** → probabilmente hai una versione vecchia/sbagliata del file locale; riscarica lo script e sovrascrivi quello esistente.
+- **Ollama non risponde / connection refused** → verifica che sia in esecuzione con `curl http://localhost:11434/api/tags`; se non risponde, avvialo (di solito parte da solo dopo l'installazione, altrimenti lancia `ollama serve`).
+- **`ERRORE: nessuna API key fornita`** (Fase 3) → imposta `TAVILY_API_KEY` come da sezione 1.4, oppure passa `--api-key`.
+- **Il modello restituisce output JSON malformato ripetutamente** → prova a controllare i log `[DEBUG] raw model content` (se presenti) per vedere cosa genera davvero il modello, spesso segnala un disallineamento tra il prompt e il formato atteso dal parsing.
