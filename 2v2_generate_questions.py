@@ -56,6 +56,8 @@ Formato output — modalità document (per ogni riga):
           "assertion": "Bernie Sanders condemned the Puerto Rico bill as 'colonialism at its worst'",
           "centrality": 5,
           "query": "Bernie Sanders Puerto Rico bill colonialism",
+          "question": "What did Bernie Sanders say about the Puerto Rico bill?",
+          "answer": "He called it 'colonialism at its worst'",
           "provenance": "document_text"
         },
         ...
@@ -139,48 +141,87 @@ USER_PROMPT_TEMPLATE = "Claim: {claim}"
 
 SYSTEM_PROMPT_DOCUMENT = """You are given the title and text of a news article.
 
-            Decompose the article into its key factual assertions. For each one, produce
-            a short, atomic, independently verifiable search query to find sources that
-            confirm or contradict it.
+            Decompose the article into its key factual assertions. For each one, produce:
+            (a) a short, atomic, independently verifiable search-engine QUERY to find
+            sources that confirm or contradict it,
+            (b) a natural-language QUESTION that could be put to one of the retrieved
+            source articles to check whether it actually confirms or contradicts the
+            assertion, and
+            (c) the ANSWER to that question, according ONLY to this article — this is
+            the reference answer that will later be compared against the answer
+            extracted from each independently retrieved source, to see if they agree.
 
             Respond with ONLY a valid JSON object, no markdown, no commentary, in
             exactly this schema:
 
             {
               "assertions": [
-                {"id": 1, "assertion": "short paraphrase of the fact", "centrality": 1-5, "query": "search-engine-style query"}
+                {"id": 1, "assertion": "short paraphrase of the fact", "centrality": 1-5, "query": "search-engine-style query", "question": "natural-language verification question", "answer": "answer to the question, per this article"}
               ]
             }
 
             - "centrality" (1-5): 5 = the article's main claim/event, 3-4 = supporting
             facts, 1-2 = minor/background details.
-            - "query": short and natural, not a full sentence or question.
+            - "query": short and natural, not a full sentence or question — this is
+            what gets typed into a search engine to FIND candidate source articles.
+            - "question": a full, self-contained natural-language question that will
+            later be asked directly against the text of each retrieved candidate
+            article, to check whether that specific article actually confirms the
+            assertion (this is the ANSWERING step, downstream of the search). It must:
+              * be self-contained (include the relevant named entities, so it makes
+                sense even without seeing the original article — do not use vague
+                pronouns like "he"/"it"/"the bill" without naming the referent);
+              * be phrased NEUTRALLY, i.e. NOT as a yes/no question about the claim
+                itself (avoid "Did Sanders call the bill colonialism?" — prefer "What
+                did Sanders say about the bill?"), so that an independent article's
+                content can be compared against the article's own answer, rather than
+                just confirmed/denied;
+              * target exactly the same single fact as its paired "query" and
+                "assertion" (one question = one assertion, do not bundle multiple
+                facts into one question);
+              * for exclusivity/superlative assertions ("only", "first", "most",
+                etc.), be phrased so it can surface counter-evidence, e.g. "What are
+                all the drama-mystery television series released in 2012?" rather
+                than a yes/no framing.
+            - "answer": the answer to "question", using ONLY information explicitly
+            stated in THIS article (verbatim or minimally rephrased, like the
+            "question" it pairs with — self-contained, no dangling pronouns). This is
+            the article's own claim on that fact, to be checked later against what
+            independent sources say when answering the same "question" about them.
+            Never invent, infer, round, or fill in a detail that is not in the text —
+            if the article does not fully answer its own question, say so briefly
+            (e.g. "Not specified beyond X") rather than guessing. For exclusivity/
+            superlative assertions, the answer should state what the article claims
+            (e.g. "According to the article, it is the only one") without asserting
+            it as an external, verified fact.
 
-            GROUNDING (critical): every entity, date, number, or name in a query must
-            appear explicitly in the article. Never infer, round, or "correct" a date
-            or number that seems plausible — if it's not stated in the text, leave it
-            out. Before finalizing a query, check you could point to the exact sentence
-            supporting each fact in it.
+            GROUNDING (critical): every entity, date, number, or name in a query,
+            question, or answer must appear explicitly in the article. Never infer,
+            round, or "correct" a date or number that seems plausible — if it's not
+            stated in the text, leave it out. Before finalizing an entry, check you
+            could point to the exact sentence supporting each fact in it.
 
             ENTITIES: resolve nicknames, pejorative epithets, or informal monikers to
             the real name of the person/entity they refer to (e.g. "Mr. Teleprompter"
-            → "Obama"). The query must use the real, searchable name — a query built
-            around a nickname will not find real sources. The informal wording can stay
-            in "assertion" for context, but never in "query".
+            → "Obama"). The query, question, and answer must all use the real,
+            searchable name — a nickname will not find real sources and won't be
+            recognized by an unrelated article. The informal wording can stay in
+            "assertion" for context, but never in "query", "question", or "answer".
 
             SCOPE: only extract assertions about the event/story being reported. Ignore
             metadata about the article itself (image credits, author bio, embedded
             media captions, formatting).
 
-            ATOMICITY: one query = one verifiable fact. Don't combine unrelated facts
-            into one query, and don't generate multiple queries for the same fact from
-            different angles (pick the most specific one).
+            ATOMICITY: one query/question/answer triple = one verifiable fact. Don't
+            combine unrelated facts into one entry, and don't generate multiple
+            entries for the same fact from different angles (pick the most specific
+            one).
 
             Skip generic, trivial, or purely rhetorical details. Opinions/interpretations
             are fine to include if there's a verifiable fact underneath them (e.g. "X
             said Y"), even if the wording itself is rhetorical.
 
-            Aim for ~4-8 queries depending on the article's density of distinct facts.
+            Aim for ~4-8 entries depending on the article's density of distinct facts.
 """
 
 USER_PROMPT_DOCUMENT_TEMPLATE = "Document title: {title}\nDocument text: {text}"
@@ -313,9 +354,9 @@ def call_ollama_questions_document_chunk(title: str, text_chunk: str, model: str
                                           max_retries: int = 3, timeout: int = 180) -> list:
     """Come call_ollama_questions, ma per un chunk di documento. Il prompt per
     documenti (SYSTEM_PROMPT_DOCUMENT) chiede al modello una LISTA JSON piatta
-    [{"id":..., "assertion":..., "centrality":..., "query":...}], non l'oggetto
-    {"questions": [...]} usato in modalità claim — il parsing qui sotto è
-    specifico per questo schema."""
+    [{"id":..., "assertion":..., "centrality":..., "query":..., "question":..., "answer":...}],
+    non l'oggetto {"questions": [...]} usato in modalità claim — il parsing qui
+    sotto è specifico per questo schema."""
     payload = {
         "model": model,
         "messages": [
@@ -353,17 +394,31 @@ def call_ollama_questions_document_chunk(title: str, text_chunk: str, model: str
                     continue
                 assertion = str(item.get("assertion", "")).strip()
                 query = str(item.get("query", "")).strip()
+                question = str(item.get("question", "")).strip()
+                answer = str(item.get("answer", "")).strip()
                 centrality = item.get("centrality", 3)
                 try:
                     centrality = int(centrality)
                 except (TypeError, ValueError):
                     centrality = 3
                 centrality = max(1, min(5, centrality))
+                # "question" e "answer" sono opzionali a livello di validazione (non
+                # scartiamo l'intera voce se mancano, per non perdere query buone
+                # quando il modello dimentica un campo), ma vengono richiesti
+                # sempre nel prompt; se mancano, ripieghiamo su fallback naive
+                # derivati dall'assertion, così l'entry resta completa e usabile
+                # nel confronto a valle.
+                if not question and assertion:
+                    question = f"What does the article say about: {assertion}?"
+                if not answer and assertion:
+                    answer = assertion
                 if assertion and query:
                     cleaned.append({
                         "assertion": assertion,
                         "centrality": centrality,
                         "query": query,
+                        "question": question,
+                        "answer": answer,
                         "provenance": "document_text",
                     })
             if cleaned:
@@ -532,10 +587,10 @@ def process_file_documents(input_path: str, output_path: str, model: str, limit:
             questions = call_ollama_questions_document(
                 title, text, model=model, max_words=max_words, overlap_words=overlap_words,
             )
-            # nota: con SYSTEM_PROMPT_DOCUMENT la query è già generata insieme
-            # all'assertion in un unico step, quindi qui non serve più una
-            # seconda chiamata a call_ollama_queries (a differenza della
-            # modalità 'claim', dove restano due step separati)
+            # nota: con SYSTEM_PROMPT_DOCUMENT sia la query che la question sono
+            # già generate insieme all'assertion in un unico step, quindi qui non
+            # serve più una seconda chiamata a call_ollama_queries (a differenza
+            # della modalità 'claim', dove restano due step separati)
 
             new_record = {
                 "id": doc_id,

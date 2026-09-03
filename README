@@ -111,7 +111,7 @@ python3 2_generate_questions.py --input Files/evaluation.csv --output Files/eval
 - SECOND PROMPT
 ```bash
 # Modalità claim
-python3 2v2_generate_questions.py --input Files/claims.jsonl --output Files/claims_with_questions_second_prompt.jsonl
+python3 2v2_generate_questions.py --input Files/evaluation_with_questions_second_prompt.jsonl --output Files/claims_with_questions_second_prompt.jsonl
 
 # Modalità document
 python3 2v2_generate_questions.py --input Files/evaluation.csv --output Files/evaluation_with_questions_second_prompt.jsonl --mode document
@@ -207,6 +207,9 @@ python3 generate_questions.py --input evaluation.csv --output evaluation_with_qu
 
 # Fase 3 (usa l'output della Fase 2 come input)
 python3 download_sources.py --input evaluation_with_questions.jsonl --output-dir sources --num-results 5 --limit 20
+
+# Fase 4
+python3 4_blind_matching.py --questions Files/evaluation_with_questions_second_prompt.jsonl --sources-dir Files/sources --output-dir Files/matching_results
 ```
 
 ---
