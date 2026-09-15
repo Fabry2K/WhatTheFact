@@ -209,7 +209,10 @@ python3 generate_questions.py --input evaluation.csv --output evaluation_with_qu
 python3 download_sources.py --input evaluation_with_questions.jsonl --output-dir sources --num-results 5 --limit 20
 
 # Fase 4
-python3 4_blind_matching.py --questions Files/evaluation_with_questions_second_prompt.jsonl --sources-dir Files/sources --output-dir Files/matching_results
+python3 4_blind_matching.py --questions Files/claims_with_questions.jsonl --sources-dir Files/sources --output-dir Files/matching_results
+
+# Evaluation
+python3 5_evaluate.py --matching-dir Files/matching_results --labels claims_labelled.jsonl
 ```
 
 ---

@@ -76,6 +76,35 @@ Fase 3, si veda il piano v2 con `domain_authority`), una singola fonte autorevol
 in contraddizione puo' essere annacquata da piu' fonti minori concordi. E' una
 scelta consapevole vista l'assenza di quello score, non un difetto nascosto.
 
+NEI e copertura fonti (Wikipedia vs extra-Wikipedia)
+======================================================
+FEVER etichetta NOT ENOUGH INFO in base a cosa un annotatore ha trovato SOLO su
+Wikipedia. La nostra pipeline cerca open-domain (Fase 3 senza whitelist), quindi
+puo' trovare evidenza SUPPORTS/REFUTES per claim che FEVER etichetta NEI — senza
+che questo sia un errore della pipeline. Per non falsare le metriche, ogni claim
+con gold_label == NOT ENOUGH INFO viene classificato in un bucket, guardando i
+`source_url` delle sole righe che hanno dato un segnale (esito != "Non
+verificabile") nelle domande coperte:
+
+    agreement                     -> anche la pipeline dice NEI (nessun disaccordo)
+    wikipedia_recall_miss         -> la pipeline trova SUPPORTS/REFUTES usando
+                                      SOLO fonti Wikipedia (possibile miss di
+                                      recall dell'annotatore originale: da
+                                      controllare, e' comunque un errore
+                                      "interno" a Wikipedia)
+    source_coverage_disagreement  -> la pipeline trova SUPPORTS/REFUTES con
+                                      almeno una fonte extra-Wikipedia (limite
+                                      noto del dataset, non un errore della
+                                      pipeline)
+    no_evidence_url               -> predicted label != NEI ma le righe che
+                                      hanno dato segnale non hanno source_url
+                                      (dato mancante, da controllare a parte)
+
+L'accuracy "adjusted" riportata in fondo non conta come errore i claim del
+bucket source_coverage_disagreement (li esclude dal denominatore), a differenza
+dell'accuracy "grezza" che li conta come sbagliati come farebbe uno scoring
+FEVER standard.
+
 Uso:
     python 5_evaluate.py --matching-dir claim_matching --labels claims_labelled.jsonl
 """
@@ -86,6 +115,7 @@ import json
 import os
 import sys
 from collections import Counter
+from urllib.parse import urlparse
 
 ESITO_SCORE = {
     "Concorda": 1.0,
@@ -95,18 +125,35 @@ ESITO_SCORE = {
 }
 
 VALID_LABELS = ("SUPPORTS", "REFUTES", "NOT ENOUGH INFO")
+NEI_LABEL = "NOT ENOUGH INFO"
 
 DEFAULT_CENTRALITY = 3  # fallback se una domanda non ha centrality (non dovrebbe capitare)
 
 
-def aggregate_question(rows: list, verified_weight: float, unverified_weight: float):
-    """Aggrega le fonti di UNA domanda in (punteggio, coperta).
+def is_wikipedia_domain(url: str) -> bool:
+    """True se l'URL appartiene a un dominio Wikipedia (qualsiasi lingua)."""
+    if not url:
+        return False
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return False
+    return "wikipedia.org" in host
 
-    Ritorna (None, False) se nessuna fonte porta segnale (tutte "Non
+
+def aggregate_question(rows: list, verified_weight: float, unverified_weight: float):
+    """Aggrega le fonti di UNA domanda in (punteggio, coperta, source_urls).
+
+    source_urls sono gli URL delle sole righe che hanno dato un segnale
+    (esito diverso da "Non verificabile"): sono le fonti che hanno
+    effettivamente determinato il verdetto su questa domanda.
+
+    Ritorna (None, False, []) se nessuna fonte porta segnale (tutte "Non
     verificabile" o dati mancanti): la domanda resta non coperta.
     """
     total_weight = 0.0
     weighted_sum = 0.0
+    source_urls = []
     for row in rows:
         score = ESITO_SCORE.get(row.get("esito"))
         if score is None:
@@ -114,10 +161,13 @@ def aggregate_question(rows: list, verified_weight: float, unverified_weight: fl
         weight = verified_weight if row.get("evidenza_verificata") else unverified_weight
         weighted_sum += score * weight
         total_weight += weight
+        url = row.get("source_url")
+        if url:
+            source_urls.append(url)
 
     if total_weight == 0:
-        return None, False
-    return weighted_sum / total_weight, True
+        return None, False, []
+    return weighted_sum / total_weight, True, source_urls
 
 
 def aggregate_claim(questions: dict, support_threshold: float, coverage_threshold: float):
@@ -127,7 +177,7 @@ def aggregate_claim(questions: dict, support_threshold: float, coverage_threshol
     covered_centrality = 0.0
     weighted_sum = 0.0
 
-    for question_score, centrality, covered in questions.values():
+    for question_score, centrality, covered, _urls in questions.values():
         c = centrality if centrality else DEFAULT_CENTRALITY
         total_centrality += c
         if covered:
@@ -149,6 +199,27 @@ def aggregate_claim(questions: dict, support_threshold: float, coverage_threshol
     return label, claim_score, coverage
 
 
+def classify_nei_bucket(predicted_label: str, questions: dict) -> str:
+    """Classifica un claim con gold_label == NEI in uno dei quattro bucket,
+    guardando i source_url delle domande COPERTE (quelle che hanno contribuito
+    al verdetto)."""
+    if predicted_label == NEI_LABEL:
+        return "agreement"
+
+    urls = []
+    for _score, _centrality, covered, source_urls in questions.values():
+        if covered:
+            urls.extend(source_urls)
+
+    if not urls:
+        return "no_evidence_url"
+
+    if all(is_wikipedia_domain(u) for u in urls):
+        return "wikipedia_recall_miss"
+
+    return "source_coverage_disagreement"
+
+
 def evaluate_claim(rows: list, verified_weight: float, unverified_weight: float,
                     support_threshold: float, coverage_threshold: float) -> dict:
     """Dalle righe grezze di Fase 4 (un claim) al verdetto finale, passando dai
@@ -159,9 +230,9 @@ def evaluate_claim(rows: list, verified_weight: float, unverified_weight: float,
 
     questions = {}
     for index, question_rows in by_question.items():
-        score, covered = aggregate_question(question_rows, verified_weight, unverified_weight)
+        score, covered, source_urls = aggregate_question(question_rows, verified_weight, unverified_weight)
         centrality = question_rows[0].get("centrality")
-        questions[index] = (score if covered else 0.0, centrality, covered)
+        questions[index] = (score if covered else 0.0, centrality, covered, source_urls)
 
     label, claim_score, coverage = aggregate_claim(questions, support_threshold, coverage_threshold)
     return {
@@ -169,8 +240,9 @@ def evaluate_claim(rows: list, verified_weight: float, unverified_weight: float,
         "score": round(claim_score, 4),
         "coverage": round(coverage, 4),
         "n_domande": len(questions),
-        "n_domande_coperte": sum(1 for _, _, covered in questions.values() if covered),
+        "n_domande_coperte": sum(1 for _, _, covered, _ in questions.values() if covered),
         "n_fonti_totali": len(rows),
+        "_questions": questions,  # uso interno per classify_nei_bucket, rimosso prima di scrivere su file
     }
 
 
@@ -246,7 +318,8 @@ def compute_metrics(pairs: list) -> dict:
     }
 
 
-def print_report(metrics: dict, confusion: dict):
+def print_report(metrics: dict, confusion: dict, nei_buckets: Counter,
+                  adjusted_accuracy: float, n_adjusted: int):
     labels = VALID_LABELS
     print("\n=== Matrice di confusione (righe = reale, colonne = predetto) ===")
     header = "reale\\predetto".ljust(18) + "".join(l[:14].ljust(16) for l in labels)
@@ -263,10 +336,19 @@ def print_report(metrics: dict, confusion: dict):
         m = metrics["per_class"][label]
         print(f"{label:<18}{m['precision']:<12.3f}{m['recall']:<12.3f}{m['f1']:<12.3f}{m['support']:<10}")
 
-    print(f"\naccuracy complessiva: {metrics['accuracy']:.3f}  (n={metrics['n']})")
+    print(f"\naccuracy grezza (standard):  {metrics['accuracy']:.3f}  (n={metrics['n']})")
+    print(f"accuracy adjusted (esclude source_coverage_disagreement): {adjusted_accuracy:.3f}  (n={n_adjusted})")
     print(f"macro precision:      {metrics['macro_precision']:.3f}")
     print(f"macro recall:         {metrics['macro_recall']:.3f}")
     print(f"macro F1:             {metrics['macro_f1']:.3f}")
+
+    n_nei = sum(nei_buckets.values())
+    if n_nei:
+        print(f"\n=== Breakdown claim gold=NOT ENOUGH INFO (totale {n_nei}) ===")
+        for bucket in ("agreement", "wikipedia_recall_miss", "source_coverage_disagreement", "no_evidence_url"):
+            count = nei_buckets.get(bucket, 0)
+            pct = 100 * count / n_nei
+            print(f"  {bucket:<32} {count:>5}  ({pct:.1f}%)")
 
 
 def main():
@@ -305,6 +387,7 @@ def main():
     output_path = args.output or os.path.join(args.matching_dir, "verdicts.jsonl")
     pairs = []
     confusion = Counter()
+    nei_buckets = Counter()
     n_no_gold = 0
 
     with open(output_path, "w", encoding="utf-8") as out_f:
@@ -319,7 +402,13 @@ def main():
                 rows, verified_weight=args.verified_weight, unverified_weight=args.unverified_weight,
                 support_threshold=args.support_threshold, coverage_threshold=args.coverage_threshold,
             )
+            questions = verdict.pop("_questions")
             gold = gold_labels.get(claim_id)
+
+            nei_bucket = None
+            if gold == NEI_LABEL:
+                nei_bucket = classify_nei_bucket(verdict["predicted_label"], questions)
+                nei_buckets[nei_bucket] += 1
 
             record = {
                 "claim_id": claim_id,
@@ -327,6 +416,7 @@ def main():
                 **verdict,
                 "gold_label": gold,
                 "correct": (verdict["predicted_label"] == gold) if gold else None,
+                "nei_bucket": nei_bucket,
             }
             out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -345,7 +435,16 @@ def main():
         sys.exit(1)
 
     metrics = compute_metrics(pairs)
-    print_report(metrics, confusion)
+
+    # accuracy "adjusted": esclude dal denominatore i claim gold=NEI finiti nel
+    # bucket source_coverage_disagreement, che non sono errori della pipeline
+    # ma limiti noti del dataset (evidenza extra-Wikipedia che FEVER non poteva vedere)
+    n_excluded = nei_buckets.get("source_coverage_disagreement", 0)
+    n_adjusted = len(pairs) - n_excluded
+    n_correct_adjusted = sum(1 for p, g in pairs if p == g)
+    adjusted_accuracy = n_correct_adjusted / n_adjusted if n_adjusted else 0.0
+
+    print_report(metrics, confusion, nei_buckets, adjusted_accuracy, n_adjusted)
 
 
 if __name__ == "__main__":
