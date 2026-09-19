@@ -48,6 +48,7 @@ Uso:
 """
 
 import argparse
+import concurrent.futures
 import json
 import os
 import re
@@ -57,6 +58,33 @@ import requests
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
 DEFAULT_MODEL = "qwen2.5:7b-instruct"
+DEFAULT_KEEP_ALIVE = "30m"  # tiene il modello caricato fra una chiamata e l'altra
+                             # (default Ollama: 5m -> ricarica il modello da zero se
+                             # passano piu' di 5 minuti fra due chiamate, es. per delay
+                             # o download lenti fra un claim e l'altro)
+DEFAULT_WORKERS = 4  # chiamate concorrenti a Ollama; combacia col default server-side
+                      # di OLLAMA_NUM_PARALLEL nelle versioni recenti. Su CPU (anziche'
+                      # GPU) il guadagno da parallelizzare puo' essere marginale o nullo:
+                      # se non noti differenze rispetto a --workers 1, il collo di
+                      # bottiglia e' il calcolo, non la concorrenza di rete.
+
+def normalize_keep_alive(value):
+    """Ollama vuole un numero (secondi, o -1 per 'sempre') oppure una stringa
+    di durata CON unita' (es. "30m"). Una stringa puramente numerica come "-1"
+    o "300" (quella che arriva da --keep-alive via CLI) va convertita in int,
+    altrimenti Ollama la rifiuta con 400 ("missing unit in duration")."""
+    if isinstance(value, str) and re.fullmatch(r"-?\d+", value):
+        return int(value)
+    return value
+
+# sessione HTTP condivisa: riusa la connessione TCP/keep-alive verso Ollama invece
+# di aprirne una nuova a ogni requests.post()
+_SESSION = requests.Session()
+# pool piu' ampio del default (10): con --workers > 10 servono piu' connessioni
+# aperte in parallelo verso Ollama, altrimenti requests le mette comunque in coda
+_adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
+_SESSION.mount("http://", _adapter)
+_SESSION.mount("https://", _adapter)
 
 MAX_ARTICLE_CHARS = 12000  # limite prudente per il contesto di un modello 7B (con num_ctx=8192 sotto)
 DEFAULT_DOCS_PER_QUESTION = 5
@@ -76,97 +104,38 @@ def normalize_esito(value):
     key = re.sub(r"\s+", " ", value.strip().lower())
     return _ESITO_NORMALIZED.get(key)
 
-SYSTEM_PROMPT_READ = """Sei un lettore di articoli. Ricevi una DOMANDA e il testo di \
-un ARTICOLO CANDIDATO. Il tuo unico compito e' rispondere alla domanda usando \
-ESCLUSIVAMENTE cio' che e' scritto nell'articolo — mai la tua conoscenza pregressa, mai \
-informazioni implicite non presenti nel testo.
+SYSTEM_PROMPT_READ = """Sei un lettore di articoli.
 
-Non stai giudicando se l'articolo sia vero o falso, e non hai (giustamente) nessuna \
-risposta attesa con cui confrontarti: devi solo riferire cosa dice questo testo \
-sull'argomento della domanda.
+Rispondi alla DOMANDA usando esclusivamente le informazioni presenti nell'ARTICOLO. Non usare conoscenze esterne.
 
-Come leggere:
-- Cerca nel testo tutto cio' che riguarda l'argomento della domanda e riportalo, anche se \
-copre solo in parte quello che la domanda chiede, anche se e' espresso con parole diverse.
-- Non pretendere di ritrovare una formulazione precisa: se l'articolo tratta lo stesso \
-fatto in modo piu' generico o piu' sintetico, quella e' comunque la risposta dell'articolo.
-- Solo se nel testo non c'e' proprio nulla sull'argomento, rispondi null.
+Se l'articolo non contiene informazioni utili per rispondere, usa null.
 
-Rispondi SOLO con un oggetto JSON con questa struttura esatta, senza testo aggiuntivo \
-prima o dopo, senza markdown/backtick:
+Restituisci esclusivamente questo JSON:
+{"risposta_articolo": "...", "evidenza": "..."}
 
-{"risposta_articolo": "<cio' che l'articolo dice sull'argomento della domanda, anche se \
-parziale; null SOLO se l'articolo non ne parla affatto>", \
-"evidenza": "<citazione ESATTA e VERBATIM copiata dal testo dell'articolo che supporta la \
-risposta, oppure null se risposta_articolo e' null>"}
-
-Regole vincolanti:
-- "evidenza" deve essere una citazione letterale copiata parola per parola dall'articolo \
-(serve per una verifica automatica tramite string-matching). Non parafrasare, non tradurre, \
-non correggere refusi, non aggiungere virgolette di incapsulamento attorno alla citazione \
-e non lasciarci dentro virgole o altri residui di sintassi JSON.
-- "evidenza" deve essere BREVE: al massimo una frase o circa 250 caratteri. Se il passaggio \
-rilevante e' piu' lungo, scegli la porzione minima che basta a supportare la risposta.
-- IMPORTANTE per la validita' del JSON: se la citazione copiata contiene un carattere \
-virgolette doppie (") al suo interno, DEVI escaparlo scrivendo \\" (backslash seguito da \
-virgolette), esattamente come richiesto dallo standard JSON per le stringhe. Non scrivere \
-mai un carattere " grezzo, non escapato, dentro il valore di un campo stringa: questo \
-invaliderebbe l'intero JSON. Se preferisci, puoi anche sostituire le virgolette doppie \
-interne con virgolette singole (') per evitare il problema, purche' il resto della \
-citazione resti verbatim.
-- Non usare in nessun caso conoscenza esterna all'articolo fornito."""
+"risposta_articolo" deve contenere la risposta alla domanda, anche se parziale.
+"evidenza" deve essere una citazione breve, esatta e verbatim dell'articolo che supporta la risposta. Se la risposta è null, anche "evidenza" deve essere null.
+"""
 
 
-SYSTEM_PROMPT_COMPARE = """Confronti due risposte alla stessa DOMANDA e classifichi il \
-loro rapporto.
+SYSTEM_PROMPT_COMPARE = """Confronta RISPOSTA A e RISPOSTA B rispetto alla DOMANDA.
 
-- RISPOSTA A e' stata estratta da un articolo trovato in modo indipendente.
-- RISPOSTA B e' la risposta di riferimento, cioe' cio' che sostiene l'articolo originale \
-sotto verifica. NON e' detto che sia vera: e' solo la tesi da controllare.
+A proviene da un articolo trovato indipendentemente. B è la risposta di riferimento e rappresenta ciò che sostiene l'articolo originale, non necessariamente la verità.
 
-Il confronto riguarda la SOSTANZA, non le parole usate ne' il livello di dettaglio. \
-Due risposte formulate diversamente che indicano lo stesso fatto concordano.
+Valuta il significato, non le parole o il livello di dettaglio.
 
-Classifica l'esito confrontando A con B:
-- "Concorda": A indica la stessa informazione di B. Rientra qui anche il caso in cui A \
-sia PIU' RICCA o PIU' PRECISA di B: aggiungere dettagli che B non riporta non e' un \
-disaccordo, e' la stessa risposta detta meglio. Se B dice "una rivista" e A dice "una \
-rivista mensile statunitense fondata nel 1953", le due CONCORDANO.
-- "Contraddice": A e B assegnano allo stesso attributo valori INCOMPATIBILI, tali che non \
-possano essere veri entrambi (mese, anno, nome, luogo o esito diverso: "ottobre" contro \
-"settembre", "greco" contro "americano"). Serve un'incompatibilita' reale: una differenza \
-di formulazione o di grado di dettaglio non e' una contraddizione.
-- "Parzialmente concorda": A riguarda lo stesso fatto e non lo smentisce, ma ne copre solo \
-una parte, oppure diverge su un aspetto secondario mentre concorda su quello principale.
-- "Non verificabile": A non riguarda l'argomento della domanda, quindi non permette di \
-dire nulla su B.
+Classifica il rapporto come:
 
-Prima di scegliere, chiediti: "A e B possono essere vere entrambe?". Se si', l'esito NON \
-puo' essere "Contraddice".
+* "Concorda": A e B esprimono la stessa informazione. A può essere più dettagliata o precisa.
+* "Contraddice": A e B esprimono valori incompatibili sullo stesso fatto.
+* "Parzialmente concorda": A riguarda lo stesso fatto, ma ne riporta solo una parte o omette dettagli rilevanti.
+* "Non verificabile": A non contiene informazioni pertinenti alla domanda.
 
-I due errori piu' frequenti, entrambi da evitare:
-- classificare "Contraddice" quando A e' semplicemente piu' dettagliata o formulata in \
-modo diverso da B, pur essendo compatibile con essa;
-- classificare "Non verificabile" solo perche' A non contiene ESATTAMENTE il dettaglio di \
-B: se A parla dello stesso fatto ma dice meno, l'esito e' "Parzialmente concorda".
+Una differenza di dettaglio non è una contraddizione. Se A e B possono essere vere entrambe, non scegliere "Contraddice".
 
-Esempi (illustrativi: mostrano il criterio, non riusarne il contenuto).
-
-1) A: "una rivista mensile statunitense fondata nel 1953" — B: "una rivista".
-   Esito: "Concorda". A e' piu' specifica ma dice la stessa cosa.
-2) A: "e' morto l'11 settembre 2003" — B: "e' morto in ottobre".
-   Esito: "Contraddice". Stesso attributo, valori che non possono coesistere.
-3) A: "l'organismo di controllo avra' sette membri" — B: "il territorio dovra' versare 370 \
-milioni in cinque anni per il funzionamento di quell'organismo".
-   Esito: "Parzialmente concorda". Stesso organismo, ma A non riporta la cifra.
-4) A: "il documento tratta tutt'altro argomento" — B: qualunque.
-   Esito: "Non verificabile".
-
-Rispondi SOLO con un oggetto JSON con questa struttura esatta, senza testo aggiuntivo \
-prima o dopo, senza markdown/backtick:
-
-{"esito": "Concorda" | "Contraddice" | "Parzialmente concorda" | "Non verificabile", \
-"motivazione": "<breve spiegazione in una frase del confronto fra A e B>"}"""
+Rispondi esclusivamente con:
+{"esito": "...", "motivazione": "..."}
+"""
 
 
 def sanitize_folder_name(value) -> str:
@@ -215,7 +184,7 @@ def parse_source_file(filepath: str) -> dict:
 
 def _ollama_json(system_prompt: str, user_content: str, model: str, ollama_url: str,
                   required_field: str, max_retries: int = 3, timeout: int = 300,
-                  num_predict: int = 600) -> dict:
+                  num_predict: int = 600, keep_alive: str = DEFAULT_KEEP_ALIVE) -> dict:
     """Una chiamata a Ollama in modalita' chat con output JSON forzato, con retry.
     Solleva RuntimeError se dopo tutti i tentativi non arriva un JSON valido che
     contenga `required_field`."""
@@ -235,10 +204,11 @@ def _ollama_json(system_prompt: str, user_content: str, model: str, ollama_url: 
             ],
             "format": "json",
             "stream": False,
+            "keep_alive": normalize_keep_alive(keep_alive),
             "options": {"temperature": temperature, "num_predict": num_predict, "num_ctx": 8192},
         }
         try:
-            resp = requests.post(ollama_url, json=payload, timeout=timeout)
+            resp = _SESSION.post(ollama_url, json=payload, timeout=timeout)
             resp.raise_for_status()
             content = resp.json().get("message", {}).get("content", "")
 
@@ -266,7 +236,7 @@ def _ollama_json(system_prompt: str, user_content: str, model: str, ollama_url: 
 
 
 def call_ollama(question_text: str, reference_answer: str, article_text: str, model: str, ollama_url: str,
-                 max_retries: int = 3, timeout: int = 300) -> dict:
+                 max_retries: int = 3, timeout: int = 300, keep_alive: str = DEFAULT_KEEP_ALIVE) -> dict:
     """Blind matching in DUE chiamate separate, come previsto dall'assignment.
 
     PASSO 1 (lettura cieca): il modello riceve la domanda e l'articolo candidato, e
@@ -289,7 +259,7 @@ def call_ollama(question_text: str, reference_answer: str, article_text: str, mo
             f"TESTO ARTICOLO CANDIDATO:\n{article_text[:MAX_ARTICLE_CHARS]}\n\n"
             f"Rispondi con il JSON richiesto.",
             model=model, ollama_url=ollama_url, required_field="risposta_articolo",
-            max_retries=max_retries, timeout=timeout,
+            max_retries=max_retries, timeout=timeout, keep_alive=keep_alive,
         )
     except RuntimeError as e:
         print(f"    [WARN] passo di lettura fallito: {e}", file=sys.stderr)
@@ -315,7 +285,7 @@ def call_ollama(question_text: str, reference_answer: str, article_text: str, mo
             f"RISPOSTA B (di riferimento, secondo l'articolo originale sotto verifica):\n{reference_answer}\n\n"
             f"Rispondi con il JSON richiesto.",
             model=model, ollama_url=ollama_url, required_field="esito",
-            max_retries=max_retries, timeout=timeout, num_predict=300,
+            max_retries=max_retries, timeout=timeout, num_predict=300, keep_alive=keep_alive,
         )
     except RuntimeError as e:
         print(f"    [WARN] passo di confronto fallito: {e}", file=sys.stderr)
@@ -534,7 +504,8 @@ def select_documents_for_assertion(documents: list, assertion: dict, assertion_i
 def process_claim(claim_id: str, claim_data: dict, sources_dir: str, output_dir: str,
                    model: str, ollama_url: str, delay: float, skip_existing: bool, timeout: int,
                    docs_per_question: int = DEFAULT_DOCS_PER_QUESTION, mapping: str = "pooled",
-                   min_content_chars: int = DEFAULT_MIN_CONTENT_CHARS):
+                   min_content_chars: int = DEFAULT_MIN_CONTENT_CHARS,
+                   keep_alive: str = DEFAULT_KEEP_ALIVE, workers: int = DEFAULT_WORKERS):
     folder_name = sanitize_folder_name(claim_id)
     claim_folder = os.path.join(sources_dir, folder_name)
     manifest_path = os.path.join(claim_folder, "manifest.json")
@@ -584,65 +555,82 @@ def process_claim(claim_id: str, claim_data: dict, sources_dir: str, output_dir:
             print(f"  domanda #{assertion_index} ({question_text[:60]}...): "
                   f"{len(selected)} documenti selezionati")
 
-            for rank, (score, document) in enumerate(selected, start=1):
-                print(f"    [{rank}/{len(selected)}] {document['filename']} "
-                      f"(rilevanza {score:.2f}) {document['title'][:50]}")
-                verdict = call_ollama(question_text, reference_answer, document["body"], model=model,
-                                       ollama_url=ollama_url, timeout=timeout)
-                evidenza_verificata = check_evidence(verdict["evidenza"], document["body"])
-                if verdict["evidenza"] and not evidenza_verificata:
-                    print(f"      [WARN] evidenza restituita dal modello NON trovata verbatim nel testo "
-                          f"(possibile hallucination)")
+            # le chiamate ai documenti di questa domanda sono indipendenti fra loro
+            # (stesso model/prompt, articoli diversi), quindi si sottomettono tutte
+            # insieme al pool e si raccolgono i risultati NELL'ORDINE ORIGINALE
+            # (non nell'ordine di completamento): la scrittura su disco resta
+            # deterministica e identica a prima, solo le chiamate diventano concorrenti.
+            # Con --workers 1 il comportamento e' identico alla versione sequenziale.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+                futures = [
+                    executor.submit(
+                        call_ollama, question_text, reference_answer, document["body"],
+                        model=model, ollama_url=ollama_url, timeout=timeout, keep_alive=keep_alive,
+                    )
+                    for _score, document in selected
+                ]
 
-                # "Non verificabile" significa che l'articolo non tratta l'argomento:
-                # se pero' il modello e' riuscito a estrarne una risposta, le due cose
-                # si contraddicono. Non riscriviamo il suo giudizio, ma lo segnaliamo:
-                # in Fase 5 una riga cosi' non va contata come "fonte che tace".
-                esito_incoerente = (
-                    verdict["esito"] == "Non verificabile" and bool(verdict["risposta_articolo"])
-                )
-                if esito_incoerente:
-                    print(f"      [WARN] esito 'Non verificabile' ma il modello ha comunque "
-                          f"estratto una risposta dall'articolo")
+                for rank, ((score, document), future) in enumerate(zip(selected, futures), start=1):
+                    verdict = future.result()
+                    print(f"    [{rank}/{len(selected)}] {document['filename']} "
+                          f"(rilevanza {score:.2f}) {document['title'][:50]}")
+                    evidenza_verificata = check_evidence(verdict["evidenza"], document["body"])
+                    if verdict["evidenza"] and not evidenza_verificata:
+                        print(f"      [WARN] evidenza restituita dal modello NON trovata verbatim nel testo "
+                              f"(possibile hallucination)")
 
-                result = {
-                    "claim_id": claim_id,
-                    "assertion_index": assertion_index,
-                    "assertion": assertion_text,
-                    "question": question_text,
-                    "reference_answer": reference_answer,
-                    "centrality": assertion.get("centrality"),
-                    "provenance": assertion.get("provenance"),
-                    "source_url": document["url"],
-                    "source_title": document["title"],
-                    # query che ha effettivamente recuperato questo documento: con il
-                    # pooling puo' essere diversa da quella della domanda in esame,
-                    # quindi la tracciabilita' richiesta dall'assignment ("sai perche'
-                    # una fonte e' stata cercata") viene tenuta esplicita qui
-                    "source_query": document["query"],
-                    "retrieved_by_query_index": document["query_index"],
-                    "selected_by": mapping,
-                    "selection_rank": rank,
-                    "relevance_score": round(score, 4),
-                    "source_filename": document["filename"],
-                    "risposta_articolo": verdict["risposta_articolo"],
-                    "esito": verdict["esito"],
-                    "evidenza": verdict["evidenza"],
-                    "evidenza_verificata": evidenza_verificata,
-                    "esito_incoerente": esito_incoerente,
-                    "motivazione": verdict["motivazione"],
-                }
+                    # "Non verificabile" significa che l'articolo non tratta l'argomento:
+                    # se pero' il modello e' riuscito a estrarne una risposta, le due cose
+                    # si contraddicono. Non riscriviamo il suo giudizio, ma lo segnaliamo:
+                    # in Fase 5 una riga cosi' non va contata come "fonte che tace".
+                    esito_incoerente = (
+                        verdict["esito"] == "Non verificabile" and bool(verdict["risposta_articolo"])
+                    )
+                    if esito_incoerente:
+                        print(f"      [WARN] esito 'Non verificabile' ma il modello ha comunque "
+                              f"estratto una risposta dall'articolo")
 
-                print(f"      -> {result['esito']}"
-                      + (" [evidenza NON verificata]" if verdict["evidenza"] and not evidenza_verificata else ""))
+                    result = {
+                        "claim_id": claim_id,
+                        "assertion_index": assertion_index,
+                        "assertion": assertion_text,
+                        "question": question_text,
+                        "reference_answer": reference_answer,
+                        "centrality": assertion.get("centrality"),
+                        "provenance": assertion.get("provenance"),
+                        "source_url": document["url"],
+                        "source_title": document["title"],
+                        # query che ha effettivamente recuperato questo documento: con il
+                        # pooling puo' essere diversa da quella della domanda in esame,
+                        # quindi la tracciabilita' richiesta dall'assignment ("sai perche'
+                        # una fonte e' stata cercata") viene tenuta esplicita qui
+                        "source_query": document["query"],
+                        "retrieved_by_query_index": document["query_index"],
+                        "selected_by": mapping,
+                        "selection_rank": rank,
+                        "relevance_score": round(score, 4),
+                        "source_filename": document["filename"],
+                        "risposta_articolo": verdict["risposta_articolo"],
+                        "esito": verdict["esito"],
+                        "evidenza": verdict["evidenza"],
+                        "evidenza_verificata": evidenza_verificata,
+                        "esito_incoerente": esito_incoerente,
+                        "motivazione": verdict["motivazione"],
+                    }
 
-                out_f.write(json.dumps(result, ensure_ascii=False) + "\n")
-                out_f.flush()
-                os.fsync(out_f.fileno())
-                n_saved += 1
+                    print(f"      -> {result['esito']}"
+                          + (" [evidenza NON verificata]" if verdict["evidenza"] and not evidenza_verificata else ""))
 
-                if delay > 0:
-                    time.sleep(delay)
+                    out_f.write(json.dumps(result, ensure_ascii=False) + "\n")
+                    out_f.flush()
+                    os.fsync(out_f.fileno())
+                    n_saved += 1
+
+            # con chiamate concorrenti un delay per-documento non avrebbe senso (i
+            # documenti partono gia' tutti insieme): il delay si applica una volta
+            # per domanda, fra un gruppo di chiamate concorrenti e il successivo
+            if delay > 0:
+                time.sleep(delay)
 
     print(f"  -> {n_saved} matching salvati in {output_path}")
 
@@ -722,6 +710,16 @@ def main():
     parser.add_argument("--limit", type=int, default=None, help="Processa solo le prime N righe del file di input (default: tutte)")
     parser.add_argument("--delay", type=float, default=0.0, help="Secondi di pausa tra una chiamata e l'altra (default: 0)")
     parser.add_argument("--timeout", type=int, default=300, help="Timeout in secondi per ogni chiamata a Ollama (default: 300)")
+    parser.add_argument("--keep-alive", default=DEFAULT_KEEP_ALIVE,
+                         help="Per quanto tempo Ollama tiene il modello caricato in memoria fra una "
+                              "chiamata e l'altra (default Ollama: 5m -> con pause piu' lunghe il "
+                              "modello si ricarica da zero). Usa '-1' per tenerlo sempre caricato "
+                              f"(default qui: {DEFAULT_KEEP_ALIVE})")
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
+                         help=f"Chiamate concorrenti a Ollama per domanda (default: {DEFAULT_WORKERS}). "
+                              "Usa 1 per il comportamento sequenziale originale. Su GPU con VRAM "
+                              "sufficiente il guadagno e' quasi lineare; su CPU puo' essere marginale "
+                              "o nullo, dipende da quanti thread il calcolo puo' davvero usare")
     parser.add_argument("--no-skip-existing", action="store_true", help="Non saltare i claim gia' processati (riprocessa tutto)")
     parser.add_argument("--docs-per-question", type=int, default=DEFAULT_DOCS_PER_QUESTION,
                          help=f"Quanti documenti interrogare per ciascuna domanda (default: {DEFAULT_DOCS_PER_QUESTION})")
@@ -755,7 +753,8 @@ def main():
             model=args.model, ollama_url=args.ollama_url,
             delay=args.delay, skip_existing=not args.no_skip_existing, timeout=args.timeout,
             docs_per_question=args.docs_per_question, mapping=args.mapping,
-            min_content_chars=args.min_content_chars,
+            min_content_chars=args.min_content_chars, keep_alive=args.keep_alive,
+            workers=args.workers,
         )
 
     if not args.no_rollup:
