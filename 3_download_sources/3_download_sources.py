@@ -2,46 +2,79 @@
 """
 Fase 3 (parte "Search API"): per ogni claim del file JSONL prodotto dallo script
 di Fase 2 (generate_questions.py), esegue una ricerca web per ciascuna query
-associata alle domande, e scarica le prime X pagine di risultato in una cartella
-dedicata all'id del claim.
+associata alle domande, e salva i risultati in un database **Turso** (libSQL,
+compatibile SQLite, ospitato nel cloud) invece che in cartelle+file di testo o
+in un file SQLite locale.
 
-Esempio: claim con id 36782, 3 query associate, X=5
-    -> viene creata la cartella "36782" con 15 file (5 per ogni query)
+Perché Turso invece di SQLite locale
+=====================================
 
-Usa la Tavily Search API (https://tavily.com) — free tier: 1000 crediti/mese,
-nessuna carta di credito richiesta. Una ricerca "basic" costa 1 credito.
+Le tabelle sono identiche a una versione SQLite locale (vedi sotto), ma il DB
+vive nel cloud: non serve più zippare/scaricare un file `sources.db` a ogni
+fine sessione Kaggle — ogni notebook (anche di sessioni diverse) si connette
+allo stesso database persistente con solo URL + token. Utile anche per la
+parallelizzazione multi-sessione di cui parlavamo (Colab + Kaggle in
+contemporanea): entrambe le sessioni scrivono sullo STESSO database condiviso,
+quindi la deduplica per URL funziona anche fra sessioni diverse, non solo
+dentro una singola run.
+
+Storage: due tabelle (stesso schema della versione SQLite locale)
+====================================================================
+
+    sources
+        url (PRIMARY KEY), title, body (testo compresso con zlib), content_length,
+        content_source, insufficient_content, fetched_at.
+        Una riga per URL univoco, indipendentemente da quanti claim/sessioni lo
+        trovano. Se l'URL è già in tabella, si riusa il body già salvato invece
+        di rifare la richiesta HTTP (anche il fallback fetch diretto viene
+        saltato).
+
+    claim_source_links
+        claim_id, url (FK verso sources.url), query, query_index, result_index.
+        Il collegamento fra un claim e le fonti trovate per lui.
+
+Setup Turso (una tantum, fuori da questo script)
+===================================================
+    1) Registrati su https://turso.tech (nessuna carta richiesta)
+    2) Crea un database: `turso db create <nome>` (via CLI) o dalla dashboard
+    3) Crea un token: `turso db tokens create <nome>`
+    4) Ti servono due valori: TURSO_DATABASE_URL (tipo "libsql://xxx.turso.io")
+       e TURSO_AUTH_TOKEN — passali con --turso-url/--turso-token oppure
+       impostali come variabili d'ambiente (es. Kaggle Secrets)
+
+Usa la Tavily Search API (https://tavily.com) per la ricerca — free tier: 1000
+crediti/mese, nessuna carta di credito richiesta. Una ricerca "basic" costa 1
+credito.
 
 Prerequisiti:
-    1) Una API key gratuita da https://tavily.com (formato "tvly-xxxxx")
-    2) pip install requests
+    1) pip install requests libsql
+    2) Una API key Tavily gratuita da https://tavily.com (formato "tvly-xxxxx")
+    3) Un database Turso (vedi sopra)
 
 Uso:
     export TAVILY_API_KEY="tvly-xxxxx"
-    python download_sources.py --input claims_with_questions.jsonl --output-dir sources --num-results 5
-
-    # oppure passando la chiave direttamente:
-    python download_sources.py --input claims_with_questions.jsonl --output-dir sources \
-        --num-results 5 --limit 10 --api-key tvly-xxxxx
-
-Struttura di output:
-    sources/
-      36782/
-        manifest.json              <- indice di tutti i risultati scaricati per questo claim
-        q01_r01.txt                <- risultato 1 della query 1
-        q01_r02.txt
-        ...
-        q03_r05.txt                <- risultato 5 della query 3
+    export TURSO_DATABASE_URL="libsql://il-tuo-db.turso.io"
+    export TURSO_AUTH_TOKEN="eyJ..."
+    python download_sources.py --input claims_with_questions.jsonl --num-results 5
 """
 
 import argparse
 import concurrent.futures
+import datetime
 import json
 import os
 import re
 import sys
 import threading
 import time
+import zlib
 import requests
+
+try:
+    import libsql
+except ImportError:
+    print("ERRORE: manca il pacchetto 'libsql'. Installa con: pip install libsql", file=sys.stderr)
+    sys.exit(1)
 
 try:
     import trafilatura
@@ -60,6 +93,11 @@ DEFAULT_MAX_RPM = 90  # richieste/minuto verso Tavily, condivise fra tutti i wor
                        # 100 RPM: 90 lascia un margine di sicurezza. Se hai una chiave
                        # "Production" puoi alzarlo (fino a ~900 con margine).
 
+# tentativi di retry per ogni operazione sul DB Turso: a differenza di un file
+# SQLite locale, qui c'e' di mezzo la rete, quindi un timeout/blip transitorio
+# va gestito con un retry invece di far fallire l'intero claim
+DB_MAX_RETRIES = 4
+
 FALLBACK_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -75,6 +113,12 @@ _fatal_error = threading.Event()
 # protegge i print() da interleaving illeggibile quando piu' claim vengono
 # processati in contemporanea da thread diversi
 _print_lock = threading.Lock()
+
+# protegge ogni accesso al DB: una singola connessione Turso condivisa fra tutti
+# i thread, serializzata qui invece di aprire una connessione remota per thread
+# (piu' connessioni HTTP concorrenti verso lo stesso DB non aiuterebbero, dato
+# che il vero collo di bottiglia sono le chiamate a Tavily, non il DB)
+_db_lock = threading.Lock()
 
 
 def safe_print(*args, **kwargs):
@@ -109,8 +153,132 @@ class RateLimiter:
             self._next_allowed = max(now, self._next_allowed) + self.min_interval
 
 
+# ---------------------------------------------------------------------------
+# Storage (Turso / libSQL)
+# ---------------------------------------------------------------------------
+
+def _db_call(fn, *args, **kwargs):
+    """Esegue una chiamata al DB sotto lock, con retry per errori di rete
+    transitori (a differenza di un file SQLite locale, qui c'e' sempre una
+    richiesta HTTP di mezzo)."""
+    last_err = None
+    for attempt in range(1, DB_MAX_RETRIES + 1):
+        try:
+            with _db_lock:
+                return fn(*args, **kwargs)
+        except Exception as e:
+            last_err = e
+            safe_print(f"    [DB retry {attempt}/{DB_MAX_RETRIES}] {e}")
+            time.sleep(1.5 * attempt)
+    raise RuntimeError(f"operazione sul DB Turso fallita dopo {DB_MAX_RETRIES} tentativi: {last_err}")
+
+
+def open_db(turso_url: str, turso_token: str):
+    conn = libsql.connect(database=turso_url, auth_token=turso_token)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sources (
+            url TEXT PRIMARY KEY,
+            title TEXT,
+            body BLOB,                    -- testo compresso con zlib
+            content_length INTEGER,       -- lunghezza del testo ORIGINALE (non compresso)
+            content_source TEXT,          -- tavily_raw / tavily_snippet / direct_fetch
+            insufficient_content INTEGER, -- 0/1
+            fetched_at TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS claim_source_links (
+            claim_id TEXT NOT NULL,
+            url TEXT NOT NULL REFERENCES sources(url),
+            query TEXT,
+            query_index INTEGER,
+            result_index INTEGER,
+            PRIMARY KEY (claim_id, url)
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def get_source(conn, url: str):
+    """None se l'URL non e' mai stato salvato, altrimenti un dict con i metadati
+    (senza decomprimere il body: qui serve solo per decidere se riusarlo)."""
+    def _run():
+        cur = conn.execute(
+            "SELECT title, content_length, content_source, insufficient_content "
+            "FROM sources WHERE url = ?",
+            (url,),
+        )
+        return cur.fetchone()
+
+    row = _db_call(_run)
+    if row is None:
+        return None
+    title, content_length, content_source, insufficient_content = row
+    return {
+        "title": title,
+        "content_length": content_length,
+        "content_source": content_source,
+        "insufficient_content": bool(insufficient_content),
+    }
+
+
+def insert_source(conn, url: str, title: str, body: str,
+                   content_length: int, content_source: str, insufficient_content: bool):
+    compressed = zlib.compress(body.encode("utf-8"))
+
+    def _run():
+        conn.execute(
+            "INSERT OR IGNORE INTO sources "
+            "(url, title, body, content_length, content_source, insufficient_content, fetched_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (url, title, compressed, content_length, content_source, int(insufficient_content),
+             datetime.datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+
+    _db_call(_run)
+
+
+def link_claim_source(conn, claim_id, url: str, query: str, query_index: int, result_index: int):
+    def _run():
+        conn.execute(
+            "INSERT OR REPLACE INTO claim_source_links "
+            "(claim_id, url, query, query_index, result_index) VALUES (?, ?, ?, ?, ?)",
+            (str(claim_id), url, query, query_index, result_index),
+        )
+        conn.commit()
+
+    _db_call(_run)
+
+
+def get_existing_claim_state(conn, claim_id):
+    """Ritorna (query_ordinate, n_righe) gia' collegate a questo claim, per il
+    controllo di resume. L'ordine per query_index ricostruisce la stessa sequenza
+    [title_query, query domanda 1, query domanda 2, ...] usata per costruire
+    `expected` in process_claim."""
+    def _run():
+        rows = conn.execute(
+            "SELECT DISTINCT query_index, query FROM claim_source_links "
+            "WHERE claim_id = ? ORDER BY query_index",
+            (str(claim_id),),
+        ).fetchall()
+        n_rows = conn.execute(
+            "SELECT COUNT(*) FROM claim_source_links WHERE claim_id = ?",
+            (str(claim_id),),
+        ).fetchone()[0]
+        return rows, n_rows
+
+    rows, n_rows = _db_call(_run)
+    return [q for _idx, q in rows], n_rows
+
+
+# ---------------------------------------------------------------------------
+
 def sanitize_folder_name(value) -> str:
-    """Rende sicuro come nome di cartella un id qualsiasi (int o stringa)."""
+    """Non serve piu' per creare cartelle, ma resta usata per normalizzare
+    claim_id a stringa in modo consistente col resto della pipeline (Fase 4/5
+    usano lo stesso claim_id come chiave)."""
     name = str(value).strip()
     name = re.sub(r"[^\w\-.]", "_", name)
     return name or "unknown_id"
@@ -192,16 +360,33 @@ def fallback_fetch_page(url: str, timeout: int = 20) -> str:
         return ""
 
 
-def save_result_to_file(folder: str, query_idx: int, result_idx: int, query: str, result: dict,
-                         min_content_chars: int = DEFAULT_MIN_CONTENT_CHARS) -> dict:
-    """Salva un singolo risultato su disco e restituisce la entry di manifest corrispondente.
+def save_result_to_db(conn, claim_id, query_idx: int, result_idx: int,
+                       query: str, result: dict, min_content_chars: int = DEFAULT_MIN_CONTENT_CHARS) -> dict:
+    """Salva (o riusa, se l'URL e' gia' noto) un singolo risultato nel DB e
+    collega claim_id a quella fonte. Restituisce un piccolo riepilogo per il log.
 
     Se il contenuto restituito da Tavily è più corto di `min_content_chars`
     (segno che probabilmente è solo lo snippet di ranking, non la pagina intera
     — capita su siti con paywall/bot-detection), tenta un fetch diretto della
-    pagina come fallback.
+    pagina come fallback — MA solo se l'URL non era gia' in tabella: se un
+    claim precedente lo ha gia' scaricato e valutato, non serve rifare la
+    richiesta di rete.
     """
     url = result.get("url", "")
+
+    if url:
+        existing = get_source(conn, url)
+        if existing is not None:
+            link_claim_source(conn, claim_id, url, query, query_idx, result_idx)
+            return {
+                "url": url,
+                "title": existing["title"],
+                "content_length": existing["content_length"],
+                "content_source": existing["content_source"],
+                "insufficient_content": existing["insufficient_content"],
+                "reused": True,
+            }
+
     title = result.get("title", "")
     # preferiamo il contenuto grezzo/esteso della pagina; fallback allo snippet se assente
     raw_content = result.get("raw_content")
@@ -216,34 +401,24 @@ def save_result_to_file(folder: str, query_idx: int, result_idx: int, query: str
 
     insufficient_content = len(content) < min_content_chars
 
-    filename = f"q{query_idx:02d}_r{result_idx:02d}.txt"
-    filepath = os.path.join(folder, filename)
-
-    with open(filepath, "w", encoding="utf-8") as f:
-        f.write(f"URL: {url}\n")
-        f.write(f"TITLE: {title}\n")
-        f.write(f"QUERY: {query}\n")
-        f.write(f"CONTENT_SOURCE: {content_source}\n")
-        f.write("---\n")
-        f.write(content)
+    if url:
+        insert_source(conn, url, title, content, len(content), content_source, insufficient_content)
+        link_claim_source(conn, claim_id, url, query, query_idx, result_idx)
 
     if insufficient_content:
         safe_print(f"    [WARN] contenuto molto corto ({len(content)} char, fonte: {content_source}) per {url}")
 
     return {
-        "query_index": query_idx,
-        "result_index": result_idx,
-        "query": query,
         "url": url,
         "title": title,
-        "filename": filename,
         "content_length": len(content),
         "content_source": content_source,
         "insufficient_content": insufficient_content,
+        "reused": False,
     }
 
 
-def process_claim(claim_id, questions: list, output_dir: str, num_results: int,
+def process_claim(conn, claim_id, questions: list, num_results: int,
                    api_key: str, search_depth: str, delay: float, skip_existing: bool,
                    min_content_chars: int = DEFAULT_MIN_CONTENT_CHARS,
                    title_query: str = "", rate_limiter: RateLimiter = None):
@@ -251,43 +426,28 @@ def process_claim(claim_id, questions: list, output_dir: str, num_results: int,
                                # piu' claim vengono processati in parallelo e le righe
                                # di thread diversi si intrecciano nell'output
 
-    folder_name = sanitize_folder_name(claim_id)
-    folder = os.path.join(output_dir, folder_name)
-    os.makedirs(folder, exist_ok=True)
-
-    manifest_path = os.path.join(folder, "manifest.json")
-    manifest = []
-
     current_queries = [q.get("query") or q.get("question") for q in questions]
 
     # supporto resume: si salta solo se il claim è già stato scaricato CON LE STESSE
-    # QUERY. Confrontare il solo numero di file era una trappola: dopo aver migliorato
-    # la generazione delle query in Fase 2, i claim già presenti venivano saltati e la
-    # pipeline continuava a girare sui documenti trovati con le query vecchie — quindi
-    # le query nuove non venivano mai effettivamente cercate.
-    if skip_existing and os.path.exists(manifest_path):
-        try:
-            with open(manifest_path, "r", encoding="utf-8") as f:
-                existing = json.load(f)
-            existing_queries = []
-            for entry in existing:
-                if entry.get("query") not in existing_queries:
-                    existing_queries.append(entry.get("query"))
-
-            expected = ([title_query] if title_query else []) + [q for q in current_queries if q]
+    # QUERY (stesso motivo della versione a file: dopo aver migliorato la
+    # generazione delle query in Fase 2, confrontare solo il conteggio faceva
+    # saltare claim che in realta' andavano ricercati con le query nuove).
+    if skip_existing:
+        existing_queries, n_existing_rows = get_existing_claim_state(conn, claim_id)
+        expected = ([title_query] if title_query else []) + [q for q in current_queries if q]
+        if existing_queries:
             if existing_queries != expected:
                 safe_print(f"  {tag} -> le query sono cambiate rispetto al download precedente, riscarico")
-            elif len(existing) == len(questions) * num_results:
+            elif n_existing_rows >= len(questions) * num_results:
                 safe_print(f"  {tag} -> già scaricato completamente con le stesse query, salto "
-                           f"({len(existing)} entry)")
-                return "skipped"
-        except (json.JSONDecodeError, OSError):
-            pass  # manifest corrotto/incompleto, riprocessiamo
+                           f"({n_existing_rows} fonti collegate)")
+                return
 
     if _fatal_error.is_set():
         return
 
     seen_urls = set()
+    n_saved = 0
 
     # query_index 0 = query ricavata dal titolo, mirata alla storia nel suo complesso
     # e non a una singola domanda. Serve da rete di sicurezza quando le query
@@ -303,8 +463,9 @@ def process_claim(claim_id, questions: list, output_dir: str, num_results: int,
                 continue
             if url:
                 seen_urls.add(url)
-            manifest.append(save_result_to_file(folder, 0, ri, title_query, result,
-                                                 min_content_chars=min_content_chars))
+            save_result_to_db(conn, claim_id, 0, ri, title_query, result,
+                               min_content_chars=min_content_chars)
+            n_saved += 1
         if delay > 0:
             time.sleep(delay)
 
@@ -326,38 +487,37 @@ def process_claim(claim_id, questions: list, output_dir: str, num_results: int,
 
         for ri, result in enumerate(results, start=1):
             # query diverse dello stesso claim cercano la stessa storia e ricadono
-            # spesso sulla stessa pagina: salvarla una volta sola evita di gonfiare
-            # il pool di Fase 4 con copie dello stesso documento
+            # spesso sulla stessa pagina: collegarla una volta sola per claim evita
+            # di gonfiare il pool di Fase 4 con lo stesso documento ripetuto
             url = result.get("url", "")
             if url and url in seen_urls:
-                safe_print(f"    {tag} [dup] {url} già scaricato per questo claim, salto")
+                safe_print(f"    {tag} [dup] {url} già collegato a questo claim, salto")
                 continue
             if url:
                 seen_urls.add(url)
-            entry = save_result_to_file(folder, qi, ri, query, result, min_content_chars=min_content_chars)
-            manifest.append(entry)
+            info = save_result_to_db(conn, claim_id, qi, ri, query, result,
+                                      min_content_chars=min_content_chars)
+            if info.get("reused"):
+                safe_print(f"    {tag} [riuso] {url} gia' nel DB (trovato per un altro claim)")
+            n_saved += 1
 
         if delay > 0:
             time.sleep(delay)
 
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=2)
-
-    safe_print(f"  {tag} -> {len(manifest)} pagine salvate in {folder}/")
-    return len(manifest)
+    safe_print(f"  {tag} -> {n_saved} fonti collegate nel DB")
 
 
-def process_file(input_path: str, output_dir: str, num_results: int, api_key: str,
+def process_file(input_path: str, turso_url: str, turso_token: str, num_results: int, api_key: str,
                   search_depth: str, delay: float, limit: int, skip_existing: bool,
                   min_content_chars: int = DEFAULT_MIN_CONTENT_CHARS,
                   workers: int = DEFAULT_WORKERS, max_rpm: float = DEFAULT_MAX_RPM,
                   time_budget_seconds: float = None):
-    os.makedirs(output_dir, exist_ok=True)
-
     if not HAS_TRAFILATURA:
         print("[INFO] libreria 'trafilatura' non installata: il fallback di fetch diretto "
               "per pagine con contenuto troppo corto (es. paywall/anti-scraping) sarà "
               "disattivo. Per attivarlo: pip install trafilatura", file=sys.stderr)
+
+    conn = open_db(turso_url, turso_token)
 
     records = []
     with open(input_path, "r", encoding="utf-8") as fin:
@@ -374,10 +534,6 @@ def process_file(input_path: str, output_dir: str, num_results: int, api_key: st
     # in parallelo (vedi RateLimiter)
     rate_limiter = RateLimiter(max_rpm)
 
-    total = len(records)
-    progress_lock = threading.Lock()
-    progress = {"done": 0, "skipped": 0, "pages": 0}
-
     def _handle(i, record):
         claim_id = record.get("id")
         claim = record.get("claim") or record.get("title", "")
@@ -390,31 +546,17 @@ def process_file(input_path: str, output_dir: str, num_results: int, api_key: st
 
         if not questions:
             safe_print(f"  [id={claim_id}] [WARN] nessuna domanda/query per questo claim, salto")
-            result = "skipped"
-        else:
-            result = process_claim(
-                claim_id, questions, output_dir,
-                num_results=num_results, api_key=api_key,
-                search_depth=search_depth, delay=delay,
-                skip_existing=skip_existing,
-                min_content_chars=min_content_chars,
-                title_query=title_query,
-                rate_limiter=rate_limiter,
-            )
+            return
 
-        # contatore condiviso: e' l'unico modo affidabile di sapere "a che punto
-        # siamo" quando piu' claim vengono completati in contemporanea da thread
-        # diversi — i singoli log per-claim, intrecciati fra loro, non bastano
-        with progress_lock:
-            progress["done"] += 1
-            if result == "skipped":
-                progress["skipped"] += 1
-            elif isinstance(result, int):
-                progress["pages"] += result
-            done, skipped, pages = progress["done"], progress["skipped"], progress["pages"]
-
-        safe_print(f"  [progress] {done}/{total} claim completati "
-                   f"({skipped} già scaricati in precedenza, {pages} pagine nuove salvate)")
+        process_claim(
+            conn, claim_id, questions,
+            num_results=num_results, api_key=api_key,
+            search_depth=search_depth, delay=delay,
+            skip_existing=skip_existing,
+            min_content_chars=min_content_chars,
+            title_query=title_query,
+            rate_limiter=rate_limiter,
+        )
 
     # sottomissione a chunk (non tutto insieme): cosi', se time_budget_seconds e'
     # impostato, possiamo controllare il tempo residuo fra un chunk e l'altro e
@@ -442,6 +584,14 @@ def process_file(input_path: str, output_dir: str, num_results: int, api_key: st
               f"processati. Rilancia lo stesso comando (Save & Run All) per riprendere: il "
               f"resume salta automaticamente i claim gia' scaricati.")
 
+    n_sources = _db_call(lambda: conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0])
+    n_links = _db_call(lambda: conn.execute("SELECT COUNT(*) FROM claim_source_links").fetchone()[0])
+    print(f"\n[INFO] Turso DB: {n_sources} fonti uniche, {n_links} collegamenti claim->fonte")
+    try:
+        conn.close()
+    except Exception:
+        pass  # alcune connessioni libsql remote non richiedono/supportano close() esplicito
+
     if _fatal_error.is_set():
         print("\nERRORE: API key non valida, interrotto.", file=sys.stderr)
         sys.exit(1)
@@ -450,7 +600,11 @@ def process_file(input_path: str, output_dir: str, num_results: int, api_key: st
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--input", required=True, help="Path al file JSONL prodotto da generate_questions.py")
-    parser.add_argument("--output-dir", default="sources", help="Cartella base dove creare le sottocartelle per claim (default: sources)")
+    parser.add_argument("--turso-url", default=os.environ.get("TURSO_DATABASE_URL"),
+                         help="URL del database Turso (es. libsql://il-tuo-db.turso.io). "
+                              "Default: legge da env var TURSO_DATABASE_URL.")
+    parser.add_argument("--turso-token", default=os.environ.get("TURSO_AUTH_TOKEN"),
+                         help="Auth token del database Turso. Default: legge da env var TURSO_AUTH_TOKEN.")
     parser.add_argument("--num-results", "-x", type=int, default=5, help="Numero di risultati da scaricare per ogni query (X, default: 5)")
     parser.add_argument("--limit", type=int, default=None, help="Processa solo le prime N righe del file di input (default: tutte)")
     parser.add_argument("--api-key", default=os.environ.get("TAVILY_API_KEY"), help="Tavily API key (default: legge da env var TAVILY_API_KEY)")
@@ -485,9 +639,13 @@ def main():
     if not args.api_key:
         print("ERRORE: nessuna API key fornita. Passa --api-key oppure imposta TAVILY_API_KEY.", file=sys.stderr)
         sys.exit(1)
+    if not args.turso_url or not args.turso_token:
+        print("ERRORE: URL/token Turso mancanti. Passa --turso-url/--turso-token oppure imposta "
+              "TURSO_DATABASE_URL/TURSO_AUTH_TOKEN.", file=sys.stderr)
+        sys.exit(1)
 
     process_file(
-        args.input, args.output_dir,
+        args.input, args.turso_url, args.turso_token,
         num_results=args.num_results,
         api_key=args.api_key,
         search_depth=args.search_depth,

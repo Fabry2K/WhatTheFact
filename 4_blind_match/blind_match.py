@@ -2,7 +2,7 @@
 """
 Fase 4 (step "Interrogazione Articoli", con classificazione diretta):
 per ogni claim, legge le assertion prodotte dalla Fase 2 (JSONL) e le fonti
-scaricate dalla Fase 3 (cartelle sources/<claim_id>/ con manifest.json + txt),
+scaricate dalla Fase 3 (database Turso/libSQL, tabelle sources + claim_source_links),
 e per ogni coppia (assertion, articolo) chiede a un LLM locale via Ollama di
 classificare l'esito leggendo SOLO il testo dell'articolo.
 
@@ -40,11 +40,14 @@ in tempo reale con `tail -f matching_results/<claim_id>.jsonl`.
 Prerequisiti:
     1) Ollama installato e in esecuzione (https://ollama.com)
     2) Modello scaricato: ollama pull qwen2.5:7b-instruct
-    3) pip install requests
+    3) pip install requests libsql
+    4) Un database Turso (stesso usato dalla Fase 3, vedi download_sources.py)
 
 Uso:
     python blind_matching.py --questions claims_with_questions.jsonl \
-        --sources-dir sources --output-dir matching_results
+        --output-dir matching_results
+    (URL/token Turso da --turso-url/--turso-token oppure da env var
+    TURSO_DATABASE_URL/TURSO_AUTH_TOKEN)
 """
 
 import argparse
@@ -54,10 +57,20 @@ import os
 import re
 import sys
 import time
+import zlib
 import requests
+
+try:
+    import libsql
+except ImportError:
+    print("ERRORE: manca il pacchetto 'libsql'. Installa con: pip install libsql", file=sys.stderr)
+    sys.exit(1)
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
 DEFAULT_MODEL = "qwen2.5:7b-instruct"
+DB_MAX_RETRIES = 4  # tentativi per ogni operazione sul DB Turso: c'e' sempre una
+                     # richiesta HTTP di mezzo, un blip di rete non deve far
+                     # fallire l'intero claim
 DEFAULT_KEEP_ALIVE = "30m"  # tiene il modello caricato fra una chiamata e l'altra
                              # (default Ollama: 5m -> ricarica il modello da zero se
                              # passano piu' di 5 minuti fra due chiamate, es. per delay
@@ -106,15 +119,22 @@ def normalize_esito(value):
 
 SYSTEM_PROMPT_READ = """Sei un lettore di articoli.
 
-Rispondi alla DOMANDA usando esclusivamente le informazioni presenti nell'ARTICOLO. Non usare conoscenze esterne.
+Rispondi alla DOMANDA interrogando con quella, l'ARTICOLO. Non usare conoscenze esterne.
 
-Se l'articolo non contiene informazioni utili per rispondere, usa null.
+Usa null per entrambi SOLO se l'articolo non tratta affatto l'argomento della domanda.
+Non confondere una semplice menzione di una persona/argomento con una risposta.
+
+Esempio:
+DOMANDA: "Quanti posti di lavoro ha creato la legge?"
+ARTICOLO: "...la legge, secondo l'ufficio bilancio, dovrebbe generare circa 40.000 posti entro il 2025..."
+{"risposta_articolo": "circa 40.000 posti entro il 2025", "evidenza": "dovrebbe generare circa 40.000 posti entro il 2025"}
+
 
 Restituisci esclusivamente questo JSON:
 {"risposta_articolo": "...", "evidenza": "..."}
 
 "risposta_articolo" deve contenere la risposta alla domanda, anche se parziale.
-"evidenza" deve essere una citazione breve, esatta e verbatim dell'articolo che supporta la risposta. Se la risposta è null, anche "evidenza" deve essere null.
+"evidenza" deve essere una citazione breve, esatta e verbatim della porzione dell'articolo che risponde alla domanda. Se la risposta è null, anche "evidenza" deve essere null.
 """
 
 
@@ -163,23 +183,40 @@ def load_assertions(questions_path: str) -> dict:
     return claims
 
 
-def parse_source_file(filepath: str) -> dict:
-    """Legge un file q{N}_r{M}.txt e separa header (URL/TITLE/QUERY) dal corpo."""
-    with open(filepath, "r", encoding="utf-8") as f:
-        raw = f.read()
+def _db_call(fn, *args, **kwargs):
+    """Esegue una chiamata al DB sotto retry, per errori di rete transitori
+    (a differenza di un file locale, qui c'e' sempre una richiesta HTTP di mezzo)."""
+    last_err = None
+    for attempt in range(1, DB_MAX_RETRIES + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_err = e
+            print(f"    [DB retry {attempt}/{DB_MAX_RETRIES}] {e}", file=sys.stderr)
+            time.sleep(1.5 * attempt)
+    raise RuntimeError(f"operazione sul DB Turso fallita dopo {DB_MAX_RETRIES} tentativi: {last_err}")
 
-    url, title, query, body = "", "", "", raw
-    if "\n---\n" in raw:
-        header, body = raw.split("\n---\n", 1)
-        for line in header.splitlines():
-            if line.startswith("URL: "):
-                url = line[len("URL: "):]
-            elif line.startswith("TITLE: "):
-                title = line[len("TITLE: "):]
-            elif line.startswith("QUERY: "):
-                query = line[len("QUERY: "):]
 
-    return {"url": url, "title": title, "query": query, "body": body.strip()}
+def open_turso(turso_url: str, turso_token: str):
+    return libsql.connect(database=turso_url, auth_token=turso_token)
+
+
+def fetch_claim_rows(conn, claim_id) -> list:
+    """Righe (url, query, query_index, title, body_compresso, insufficient_content)
+    per un claim, via JOIN fra claim_source_links e sources. La deduplica per URL
+    e' gia' garantita dallo schema (PRIMARY KEY (claim_id, url) in
+    claim_source_links, scritta cosi' dalla Fase 3): non serve rifarla qui."""
+    def _run():
+        cur = conn.execute(
+            "SELECT csl.url, csl.query, csl.query_index, s.title, s.body, "
+            "s.insufficient_content "
+            "FROM claim_source_links csl JOIN sources s ON csl.url = s.url "
+            "WHERE csl.claim_id = ?",
+            (str(claim_id),),
+        )
+        return cur.fetchall()
+
+    return _db_call(_run)
 
 
 def _ollama_json(system_prompt: str, user_content: str, model: str, ollama_url: str,
@@ -419,36 +456,36 @@ def clean_article_text(text: str) -> str:
     return re.sub(r"[ \t]{2,}", " ", cleaned).strip()
 
 
-def load_claim_documents(claim_folder: str, manifest: list, min_content_chars: int) -> list:
-    """Carica una sola volta i documenti del claim, deduplicati per URL e scartando
-    quelli senza contenuto utile (snippet di ranking, pagine bloccate da paywall)."""
-    documents, seen_urls = [], set()
+def load_claim_documents(conn, claim_id, min_content_chars: int) -> list:
+    """Carica i documenti del claim dal DB Turso (join claim_source_links + sources),
+    scartando quelli senza contenuto utile (snippet di ranking, pagine bloccate da
+    paywall). La deduplica per URL e' gia' garantita dallo schema — vedi
+    fetch_claim_rows — quindi qui non serve un seen_urls come nella versione a file."""
+    rows = fetch_claim_rows(conn, claim_id)
+    documents = []
     skipped_short = 0
 
-    for entry in manifest:
-        filepath = os.path.join(claim_folder, entry["filename"])
-        if not os.path.exists(filepath):
-            print(f"  [WARN] file mancante: {filepath}, salto")
+    for url, query, query_index, title, body_blob, insufficient_content in rows:
+        if insufficient_content:
+            skipped_short += 1
             continue
-
-        url = entry.get("url", "")
-        if url and url in seen_urls:
-            continue
-
-        source = parse_source_file(filepath)
-        body = clean_article_text(source["body"])
-        if len(body) < min_content_chars or entry.get("insufficient_content"):
+        try:
+            raw_body = zlib.decompress(body_blob).decode("utf-8") if body_blob else ""
+        except (zlib.error, UnicodeDecodeError) as e:
+            print(f"  [WARN] body illeggibile per {url}: {e}, salto")
             skipped_short += 1
             continue
 
-        if url:
-            seen_urls.add(url)
+        body = clean_article_text(raw_body)
+        if len(body) < min_content_chars:
+            skipped_short += 1
+            continue
+
         documents.append({
-            "filename": entry["filename"],
-            "url": url or source["url"],
-            "title": entry.get("title") or source["title"],
-            "query": entry.get("query", source["query"]),
-            "query_index": entry.get("query_index"),
+            "url": url,
+            "title": title or "",
+            "query": query or "",
+            "query_index": query_index,
             "body": body,
             "tokens": set(_doc_tokens(body[:MAX_ARTICLE_CHARS])),
         })
@@ -501,22 +538,12 @@ def select_documents_for_assertion(documents: list, assertion: dict, assertion_i
     return [(score, document) for score, _, document in scored[:max_docs]]
 
 
-def process_claim(claim_id: str, claim_data: dict, sources_dir: str, output_dir: str,
-                   model: str, ollama_url: str, delay: float, skip_existing: bool, timeout: int,
+def process_claim(conn, claim_id: str, claim_data: dict, output_dir: str,
+                   model: str, ollama_urls: list, delay: float, skip_existing: bool, timeout: int,
                    docs_per_question: int = DEFAULT_DOCS_PER_QUESTION, mapping: str = "pooled",
                    min_content_chars: int = DEFAULT_MIN_CONTENT_CHARS,
                    keep_alive: str = DEFAULT_KEEP_ALIVE, workers: int = DEFAULT_WORKERS):
     folder_name = sanitize_folder_name(claim_id)
-    claim_folder = os.path.join(sources_dir, folder_name)
-    manifest_path = os.path.join(claim_folder, "manifest.json")
-
-    if not os.path.exists(manifest_path):
-        print(f"  [WARN] nessun manifest.json trovato in {claim_folder}, salto claim {claim_id}")
-        return
-
-    with open(manifest_path, "r", encoding="utf-8") as f:
-        manifest = json.load(f)
-
     output_path = os.path.join(output_dir, f"{folder_name}.jsonl")
 
     expected_rows = len(claim_data["assertions"]) * docs_per_question
@@ -531,9 +558,9 @@ def process_claim(claim_id: str, claim_data: dict, sources_dir: str, output_dir:
     assertions = claim_data["assertions"]
     n_saved = 0
 
-    documents = load_claim_documents(claim_folder, manifest, min_content_chars=min_content_chars)
+    documents = load_claim_documents(conn, claim_id, min_content_chars=min_content_chars)
     if not documents:
-        print(f"  [WARN] nessun documento utilizzabile per il claim {claim_id}, salto")
+        print(f"  [WARN] nessun documento utilizzabile per il claim {claim_id} nel DB, salto")
         return
     print(f"  {len(documents)} documenti utilizzabili nel pool del claim")
 
@@ -561,18 +588,25 @@ def process_claim(claim_id: str, claim_data: dict, sources_dir: str, output_dir:
             # (non nell'ordine di completamento): la scrittura su disco resta
             # deterministica e identica a prima, solo le chiamate diventano concorrenti.
             # Con --workers 1 il comportamento e' identico alla versione sequenziale.
+            #
+            # Con piu' di un endpoint Ollama (una GPU ciascuno) i documenti vengono
+            # smistati a rotazione fra tutti gli endpoint: il modello sta comodamente
+            # su una sola T4 (15GB), quindi Ollama non lo spargerebbe mai da solo su
+            # entrambe le GPU — l'unico modo per usarle davvero entrambe e' avere due
+            # processi server separati e distribuire le chiamate fra i due.
             with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
                 futures = [
                     executor.submit(
                         call_ollama, question_text, reference_answer, document["body"],
-                        model=model, ollama_url=ollama_url, timeout=timeout, keep_alive=keep_alive,
+                        model=model, ollama_url=ollama_urls[idx % len(ollama_urls)],
+                        timeout=timeout, keep_alive=keep_alive,
                     )
-                    for _score, document in selected
+                    for idx, (_score, document) in enumerate(selected)
                 ]
 
                 for rank, ((score, document), future) in enumerate(zip(selected, futures), start=1):
                     verdict = future.result()
-                    print(f"    [{rank}/{len(selected)}] {document['filename']} "
+                    print(f"    [{rank}/{len(selected)}] {document['url'][:60]} "
                           f"(rilevanza {score:.2f}) {document['title'][:50]}")
                     evidenza_verificata = check_evidence(verdict["evidenza"], document["body"])
                     if verdict["evidenza"] and not evidenza_verificata:
@@ -609,7 +643,6 @@ def process_claim(claim_id: str, claim_data: dict, sources_dir: str, output_dir:
                         "selected_by": mapping,
                         "selection_rank": rank,
                         "relevance_score": round(score, 4),
-                        "source_filename": document["filename"],
                         "risposta_articolo": verdict["risposta_articolo"],
                         "esito": verdict["esito"],
                         "evidenza": verdict["evidenza"],
@@ -703,10 +736,20 @@ def build_rollup(output_dir: str, claims: dict, claim_ids: list, rollup_path: st
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--questions", required=True, help="Path al JSONL prodotto dalla Fase 2 (con campo 'questions'/assertion)")
-    parser.add_argument("--sources-dir", default="sources", help="Cartella base con le sottocartelle per claim prodotte dalla Fase 3 (default: sources)")
+    parser.add_argument("--turso-url", default=os.environ.get("TURSO_DATABASE_URL"),
+                         help="URL del database Turso con le fonti scaricate dalla Fase 3 "
+                              "(es. libsql://il-tuo-db.turso.io). Default: legge da env var "
+                              "TURSO_DATABASE_URL.")
+    parser.add_argument("--turso-token", default=os.environ.get("TURSO_AUTH_TOKEN"),
+                         help="Auth token del database Turso. Default: legge da env var TURSO_AUTH_TOKEN.")
     parser.add_argument("--output-dir", default="matching_results", help="Cartella dove salvare i risultati del matching (default: matching_results)")
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Nome del modello Ollama da usare (default: {DEFAULT_MODEL})")
     parser.add_argument("--ollama-url", default=OLLAMA_URL, help=f"URL dell'endpoint chat di Ollama (default: {OLLAMA_URL})")
+    parser.add_argument("--ollama-urls", default=None,
+                         help="Lista di endpoint Ollama separati da virgola, uno per GPU (es. "
+                              "'http://localhost:11434/api/chat,http://localhost:11435/api/chat'). "
+                              "I documenti di ogni domanda vengono smistati a rotazione fra tutti "
+                              "gli endpoint indicati. Se impostato, ha la precedenza su --ollama-url.")
     parser.add_argument("--limit", type=int, default=None, help="Processa solo le prime N righe del file di input (default: tutte)")
     parser.add_argument("--delay", type=float, default=0.0, help="Secondi di pausa tra una chiamata e l'altra (default: 0)")
     parser.add_argument("--timeout", type=int, default=300, help="Timeout in secondi per ogni chiamata a Ollama (default: 300)")
@@ -736,7 +779,24 @@ def main():
                               "senza combinarli in un verdetto unico: quella e' la Fase 5")
     parser.add_argument("--no-rollup", action="store_true",
                          help="Non generare il file riepilogativo")
+    parser.add_argument("--time-budget-minutes", type=float, default=None,
+                         help="Se impostato, lo script si ferma da solo (in modo pulito) dopo "
+                              "questi minuti invece di farsi uccidere a meta' dal limite di "
+                              "sessione della piattaforma. Il rollup viene comunque generato "
+                              "su cio' che e' gia' su disco. Rilancia lo stesso comando per "
+                              "riprendere: il resume salta i claim gia' processati.")
     args = parser.parse_args()
+
+    if not args.turso_url or not args.turso_token:
+        print("ERRORE: URL/token Turso mancanti. Passa --turso-url/--turso-token oppure imposta "
+              "TURSO_DATABASE_URL/TURSO_AUTH_TOKEN.", file=sys.stderr)
+        sys.exit(1)
+    conn = open_turso(args.turso_url, args.turso_token)
+
+    ollama_urls = [u.strip() for u in args.ollama_urls.split(",") if u.strip()] \
+        if args.ollama_urls else [args.ollama_url]
+    if len(ollama_urls) > 1:
+        print(f"[INFO] distribuzione dei documenti su {len(ollama_urls)} endpoint Ollama: {ollama_urls}")
 
     claims = load_assertions(args.questions)
     os.makedirs(args.output_dir, exist_ok=True)
@@ -745,17 +805,30 @@ def main():
     if args.limit is not None:
         claim_ids = claim_ids[:args.limit]
 
+    start_time = time.monotonic()
+    stopped_early = False
+
     for i, claim_id in enumerate(claim_ids):
+        if args.time_budget_minutes is not None and \
+                (time.monotonic() - start_time) > args.time_budget_minutes * 60:
+            stopped_early = True
+            break
         claim_data = claims[claim_id]
         print(f"[{i}] id={claim_id} -> {claim_data['title']} ({len(claim_data['assertions'])} assertion)")
         process_claim(
-            claim_id, claim_data, args.sources_dir, args.output_dir,
-            model=args.model, ollama_url=args.ollama_url,
+            conn, claim_id, claim_data, args.output_dir,
+            model=args.model, ollama_urls=ollama_urls,
             delay=args.delay, skip_existing=not args.no_skip_existing, timeout=args.timeout,
             docs_per_question=args.docs_per_question, mapping=args.mapping,
             min_content_chars=args.min_content_chars, keep_alive=args.keep_alive,
             workers=args.workers,
         )
+
+    if stopped_early:
+        remaining = len(claim_ids) - i
+        print(f"\n[TIME BUDGET] Limite di tempo raggiunto: {remaining} claim non ancora "
+              f"processati. Rilancia lo stesso comando (Save & Run All) per riprendere da "
+              f"dove si e' fermato.")
 
     if not args.no_rollup:
         rollup_path = args.rollup_output or os.path.join(args.output_dir, "rollup.jsonl")
