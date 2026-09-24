@@ -1,23 +1,7 @@
 # Pipeline di Verifica Automatica dei Claim — Guida rapida
 
 Questo README spiega come installare le dipendenze e in che ordine lanciare gli
-script sviluppati finora (Fase 2 e Fase 3 dell'assignment).
-
-## Panoramica della pipeline
-
-```
-Fase 2 — generate_questions.py
-   Input:  claims.jsonl (claim brevi)  OPPURE  evaluation.csv (articoli interi)
-   Output: *_with_questions.jsonl  (claim/documento + domande/assertion + query)
-        │
-        ▼
-Fase 3 — download_sources.py
-   Input:  il file *_with_questions.jsonl prodotto sopra
-   Output: cartella sources/<id>/  con le pagine scaricate per ogni query
-```
-
-Vanno lanciati **in questo ordine**: prima `generate_questions.py`, poi
-`download_sources.py` sul file che il primo ha prodotto.
+script della pipeline (Sia in locale che non).
 
 ---
 
