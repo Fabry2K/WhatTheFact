@@ -6,4 +6,6 @@ Files/claims_with_questions.jsonl
 evaluation.csv
 .env
 .DS_Store
-__pycache__/.DS_Store
+__pycache__/
+*.pyc
+.DS_Store
