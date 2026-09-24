@@ -456,11 +456,8 @@ def clean_article_text(text: str) -> str:
     return re.sub(r"[ \t]{2,}", " ", cleaned).strip()
 
 
-def load_claim_documents(conn, claim_id, min_content_chars: int) -> list:
-    """Carica i documenti del claim dal DB Turso (join claim_source_links + sources),
-    scartando quelli senza contenuto utile (snippet di ranking, pagine bloccate da
-    paywall). La deduplica per URL e' gia' garantita dallo schema — vedi
-    fetch_claim_rows — quindi qui non serve un seen_urls come nella versione a file."""
+def load_claim_documents(turso_url, turso_token, claim_id, min_content_chars):
+    conn = open_turso(turso_url, turso_token)
     rows = fetch_claim_rows(conn, claim_id)
     documents = []
     skipped_short = 0
@@ -538,7 +535,7 @@ def select_documents_for_assertion(documents: list, assertion: dict, assertion_i
     return [(score, document) for score, _, document in scored[:max_docs]]
 
 
-def process_claim(conn, claim_id: str, claim_data: dict, output_dir: str,
+def process_claim(turso_url, turso_token, claim_id: str, claim_data: dict, output_dir: str,
                    model: str, ollama_urls: list, delay: float, skip_existing: bool, timeout: int,
                    docs_per_question: int = DEFAULT_DOCS_PER_QUESTION, mapping: str = "pooled",
                    min_content_chars: int = DEFAULT_MIN_CONTENT_CHARS,
@@ -558,7 +555,7 @@ def process_claim(conn, claim_id: str, claim_data: dict, output_dir: str,
     assertions = claim_data["assertions"]
     n_saved = 0
 
-    documents = load_claim_documents(conn, claim_id, min_content_chars=min_content_chars)
+    documents = load_claim_documents(turso_url, turso_token, claim_id, min_content_chars=min_content_chars)
     if not documents:
         print(f"  [WARN] nessun documento utilizzabile per il claim {claim_id} nel DB, salto")
         return
@@ -791,7 +788,6 @@ def main():
         print("ERRORE: URL/token Turso mancanti. Passa --turso-url/--turso-token oppure imposta "
               "TURSO_DATABASE_URL/TURSO_AUTH_TOKEN.", file=sys.stderr)
         sys.exit(1)
-    conn = open_turso(args.turso_url, args.turso_token)
 
     ollama_urls = [u.strip() for u in args.ollama_urls.split(",") if u.strip()] \
         if args.ollama_urls else [args.ollama_url]
@@ -816,7 +812,7 @@ def main():
         claim_data = claims[claim_id]
         print(f"[{i}] id={claim_id} -> {claim_data['title']} ({len(claim_data['assertions'])} assertion)")
         process_claim(
-            conn, claim_id, claim_data, args.output_dir,
+            args.turso_url, args.turso_token, claim_id, claim_data, args.output_dir,
             model=args.model, ollama_urls=ollama_urls,
             delay=args.delay, skip_existing=not args.no_skip_existing, timeout=args.timeout,
             docs_per_question=args.docs_per_question, mapping=args.mapping,

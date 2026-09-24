@@ -55,7 +55,7 @@ Uso:
     export TAVILY_API_KEY="tvly-xxxxx"
     export TURSO_DATABASE_URL="libsql://il-tuo-db.turso.io"
     export TURSO_AUTH_TOKEN="eyJ..."
-    python download_sources.py --input claims_with_questions.jsonl --num-results 5
+    python3 3_download_sources/3_download_sources.py --input claims_with_questions.jsonl --num-results 5
 """
 
 import argparse
@@ -85,7 +85,7 @@ except ImportError:
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 DEFAULT_MIN_CONTENT_CHARS = 500
 
-DEFAULT_WORKERS = 6  # claim processati in parallelo (ognuno fa piu' query in sequenza);
+DEFAULT_WORKERS = 1  # claim processati in parallelo (ognuno fa piu' query in sequenza);
                       # il collo di bottiglia e' la rete, non la CPU, quindi qui i thread
                       # bastano (non serve multiprocessing)
 DEFAULT_MAX_RPM = 90  # richieste/minuto verso Tavily, condivise fra tutti i worker.
