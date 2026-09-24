@@ -80,9 +80,26 @@ $env:TAVILY_API_KEY="tvly-xxxxx"
 > **Non incollare mai la chiave direttamente nel codice o in chat** — se
 > l'hai già condivisa da qualche parte, rigenerala dalla dashboard Tavily.
 
+### 1.5 Turso DB URL e authorization Token
+
+1. Registrati gratis su https://turso.tech/ (500M letture, 10M scritture, 3G syncs, 5G storage -- 100 database generabili)
+2. Crea un database (si suggerisce col nome del progetto)
+3. Genera un token per accedere a quel database
+4. Esporta URL del DB e auth token
+
+```bash
+# macOS / Linux
+export TURSO_DATABASE_URL="libsql://..."
+export TURSO_AUTH_TOKEN="..."
+
+# Windows (PowerShell)
+$env:TURSO_DATABASE_URL="libsql://..."
+$env:TURSO_AUTH_TOKEN="..."
+```
+
 ---
 
-## 2. Fase 2 — `generate_questions.py`
+## 2. Fase 1 — `1_generate_questions.py`
 
 Genera domande/assertion + query di ricerca a partire dal testo sorgente
 (claim breve o documento intero), usando **solo** informazioni presenti nel
@@ -99,31 +116,19 @@ input se non specificate:
 ### Uso
 
 
-- FIRST PROMPT
 ```bash
 # Modalità claim
-python3 2_generate_questions.py --input Files/claims.jsonl --output Files/claims_with_questions_first_prompt.jsonl
+python3 1_generate_question/1_generate_questions.py --input Files/evaluation.csv --output Files/evaluation_with_questions.jsonl --mode claim --limit 20
 
 # Modalità document
-python3 2_generate_questions.py --input Files/evaluation.csv --output Files/evaluation_with_questions_first_prompt.jsonl --mode document
-
-
-- SECOND PROMPT
-```bash
-# Modalità claim
-python3 2v2_generate_questions.py --input Files/evaluation_with_questions_second_prompt.jsonl --output Files/claims_with_questions_second_prompt.jsonl
-
-# Modalità document
-python3 2v2_generate_questions.py --input Files/evaluation.csv --output Files/evaluation_with_questions_second_prompt.jsonl --mode document
+python3 1_generate_question/1_generate_questions.py --input Files/evaluation.csv --output Files/evaluation_with_questions.jsonl --mode document --limit 20
 
 
 
 **Consiglio**: testa sempre prima su poche righe con `--limit`, prima di
 lanciare la run completa (specialmente in modalità `document`, dove ogni
-articolo può generare più chiamate al modello):
+articolo può generare più chiamate al modello)
 
-```bash
-python3 generate_questions.py --input evaluation.csv --output test.jsonl --mode document --limit 5
 ```
 
 ### Argomenti principali
@@ -151,15 +156,15 @@ python3 generate_questions.py --input evaluation.csv --output test.jsonl --mode 
 
 ---
 
-## 3. Fase 3 — `download_sources.py`
+## 3. Fase 2 — `2_download_sources.py`
 
 Per ogni query generata in Fase 2, cerca su Tavily e scarica le prime **X**
-pagine di risultato, organizzate in cartelle per id del claim/documento.
+pagine di risultato, e le salva nel database di Torso.
 
 ### Uso
 
 ```bash
-python3 3_download_sources.py --input Files/***phase_2_output_file_name***.jsonl --output-dir Files/sources --num-results 5
+python3 2_download_sources/2_download_sources.py --input Files/claims_with_questions.jsonl --output-dir Files/sources --num-results 5
 ```
 
 
@@ -168,6 +173,8 @@ python3 3_download_sources.py --input Files/***phase_2_output_file_name***.jsonl
 | Argomento | Descrizione | Default |
 |---|---|---|
 | `--input` | File JSONL prodotto da `generate_questions.py` (obbligatorio) | — |
+| `--turso-url` | URL DB Turso (obbligatorio) | legge da env var `TURSO_DATABASE_URL` | — |
+| `--turso-token` | auth token DB Turso (obbligatorio) | legge da env var `TURSO_AUTH_TOKEN` | — |
 | `--output-dir` | Cartella base dove creare le sottocartelle | `sources` |
 | `--num-results` / `-x` | Numero di risultati da scaricare per query (X) | `5` |
 | `--limit` | Processa solo le prime N righe del file di input | tutte |
@@ -176,16 +183,6 @@ python3 3_download_sources.py --input Files/***phase_2_output_file_name***.jsonl
 | `--delay` | Pausa in secondi tra una query e l'altra | `0.5` |
 | `--no-skip-existing` | Riscarica anche i claim già completati | disattivo (skip attivo) |
 
-### Output
-
-```
-sources/
-  <id>/
-    manifest.json         <- indice di tutti i download per questo claim/documento
-    q01_r01.txt            <- risultato 1 della query 1 (URL, titolo, query, contenuto pagina)
-    q01_r02.txt
-    ...
-```
 
 ### Note sui crediti Tavily
 
@@ -197,22 +194,60 @@ mese** in modalità `basic`. Se devi processare un dataset grande, valuta
 
 ---
 
-## 4. Esempio di run end-to-end
+## 4. Fase 3 — `3_blind_match.py`
+
+Fase 3 (step "Interrogazione Articoli", con classificazione diretta): per ogni claim, legge le assertion prodotte dalla Fase 1 (JSONL) e le fonti scaricate dalla Fase 2 (database Turso/libSQL, tabelle sources + claim_source_links), e per ogni coppia (assertion, articolo) chiede a un LLM locale via Ollama di classificare l'esito leggendo SOLO il testo dell'articolo.
+
+
+### Uso
+
+```bash
+python3 3_blind_match/3_blind_matching.py --questions Files/claims_with_questions.jsonl --sources-dir Files/sources --output-dir Files/matching_results
+```
+
+
+### Argomenti principali
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--questions` | required | JSONL file containing the questions/assertions generated in Phase 2 |
+| `--turso-url` | `TURSO_DATABASE_URL` | URL of the Turso database containing the sources downloaded in Phase 3 |
+| `--turso-token` | `TURSO_AUTH_TOKEN` | Authentication token for the Turso database |
+| `--output-dir` | `matching_results` | Directory where matching results are saved |
+| `--model` | `qwen2.5:7b-instruct` | Ollama model used for the blind matching |
+| `--ollama-url` | `http://localhost:11434/api/chat` | Ollama chat endpoint |
+| `--ollama-urls` | `None` | Comma-separated list of Ollama endpoints, used to distribute requests across multiple GPUs |
+| `--workers` | implementation default | Number of concurrent Ollama requests |
+| `--timeout` | `300` | Maximum time in seconds allowed for each Ollama request |
+| `--keep-alive` | implementation default | How long Ollama keeps the model loaded in memory |
+| `--docs-per-question` | implementation default | Maximum number of documents evaluated for each question |
+| `--mapping` | `pooled` | Document selection strategy: `pooled` considers all documents for the claim, while `strict` only considers documents retrieved by the corresponding query |
+| `--min-content-chars` | `500` | Minimum document length; shorter documents are discarded |
+| `--limit` | `None` | Process only the first N claims |
+| `--delay` | `0` | Delay in seconds between consecutive Ollama calls |
+| `--time-budget-minutes` | `None` | Optional maximum execution time; already processed claims are skipped when the script is resumed |
+
+---
+## 5. Esempio di run end-to-end
+
+- Caricare i dataset di input (claims/documents) nella cartella Files
 
 ```bash
 export TAVILY_API_KEY="tvly-xxxxx"
+export TURSO_DATABASE_URL="libsql://..."
+export TURSO_AUTH_TOKEN="..."
 
-# Fase 2
-python3 generate_questions.py --input evaluation.csv --output evaluation_with_questions.jsonl --mode document --limit 20
+# Fase 1
+python3 1_generate_question/1_generate_questions.py --input Files/evaluation.csv --output Files/evaluation_with_questions.jsonl --mode claim --limit 20
 
-# Fase 3 (usa l'output della Fase 2 come input)
-python3 download_sources.py --input evaluation_with_questions.jsonl --output-dir sources --num-results 5 --limit 20
+# Fase 2 (usa l'output della Fase 1 come input)
+python3 2_download_sources/2_download_sources.py --input Files/claims_with_questions.jsonl --output-dir Files/sources --num-results 5
 
-# Fase 4
-python3 4_blind_matching.py --questions Files/claims_with_questions.jsonl --sources-dir Files/sources --output-dir Files/matching_results
+# Fase 3
+python3 3_blind_match/3_blind_matching.py --questions Files/claims_with_questions.jsonl --sources-dir Files/sources --output-dir Files/matching_results
 
 # Evaluation
-python3 5_evaluate.py --matching-dir Files/matching_results --labels claims_labelled.jsonl
+python3 4_evaluate.py --matching-dir Files/matching_results --labels claims_labelled.jsonl
 ```
 
 ---

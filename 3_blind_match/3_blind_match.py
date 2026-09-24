@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Fase 4 (step "Interrogazione Articoli", con classificazione diretta):
-per ogni claim, legge le assertion prodotte dalla Fase 2 (JSONL) e le fonti
-scaricate dalla Fase 3 (database Turso/libSQL, tabelle sources + claim_source_links),
+Fase 3 (step "Interrogazione Articoli", con classificazione diretta):
+per ogni claim, legge le assertion prodotte dalla Fase 1 (JSONL) e le fonti
+scaricate dalla Fase 2 (database Turso/libSQL, tabelle sources + claim_source_links),
 e per ogni coppia (assertion, articolo) chiede a un LLM locale via Ollama di
 classificare l'esito leggendo SOLO il testo dell'articolo.
 

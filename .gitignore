@@ -1,4 +1,8 @@
-/Files
+Files/matching_results
+Files/claims_labelled.jsonl
+Files/claims.jsonl
+Files/dev.jsonl
+Files/claims_with_questions.jsonl
 evaluation.csv
 .env
 .DS_Store
